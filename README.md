@@ -6,7 +6,7 @@ OpenSSL / GnuTLS / NSS and prints decrypted SSL/TLS traffic.
 ## Build
 
 ```bash
-sudo apt-get install clang llvm gcc libelf-dev zlib1g-dev make git
+sudo apt-get install clang llvm gcc libelf-dev zlib1g-dev libssl-dev make git
 git submodule update --init --recursive
 make build-bpf
 ```
