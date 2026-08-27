@@ -22,5 +22,8 @@ sudo ./bpf/sslsniff --hexdump
 
 ## License
 
-- `sslsniff` sources: LGPL-2.1 OR BSD-2-Clause (derived from BCC sslsniff)
-- Repository glue and documentation: MIT; see [LICENSE](LICENSE)
+- Kernel eBPF program (`bpf/sslsniff.bpf.c`): GPL-2.0-only
+- DatRail userspace source, build glue, and documentation: Apache-2.0
+- Vendored libbpf and bpftool trees: their upstream per-file licences
+
+See [LICENSE](LICENSE), [LICENSES](LICENSES/), and [NOTICE](NOTICE).

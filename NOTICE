@@ -4,10 +4,9 @@ Copyright (c) 2026 DatRail
 This product is part of the DatRail open-source agent-security toolchain
 (https://github.com/datrail).
 
-NOTE: the licensing of this repository is unresolved and tracked as DR-21. The
-LICENSE file says MIT, the SPDX headers say (LGPL-2.1 OR BSD-2-Clause), and
-bpf/sslsniff.bpf.c declares GPL to the kernel verifier. Do not rely on any one
-of them until that is settled.
+DatRail-owned userspace source, build glue, and documentation are distributed
+under Apache-2.0. The DatRail-owned kernel eBPF program is GPL-2.0-only. See
+LICENSE and LICENSES/ for the ratified boundary.
 
 --------------------------------------------------------------------------------
 Third-party components
@@ -19,5 +18,11 @@ libbpf — https://github.com/libbpf/libbpf
 bpftool — https://github.com/libbpf/bpftool
     Vendored, used at build time to generate skeletons and vmlinux.h.
 
-The sslsniff approach derives from BCC's tool of the same name
-(https://github.com/iovisor/bcc), under the Apache License 2.0.
+BCC sslsniff — https://github.com/iovisor/bcc
+    The probe approach and original sslsniff implementation are derived from
+    BCC's Apache-2.0-licensed tool of the same name.
+
+AgentSight — https://github.com/eunomia-bpf/agentsight
+    AgentSight carries the same BCC/eBPF TLS-capture lineage and is the runtime
+    capture implementation consumed by RailMon. It is named here for lineage;
+    AgentSight source is not vendored in this repository.

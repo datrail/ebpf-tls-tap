@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2023 Yusheng Zheng
 //
 // Based on sslsniff from BCC by Adrian Lopez & Mark Drayton.
