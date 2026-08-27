@@ -11,10 +11,10 @@ Open an issue first for anything beyond an obvious fix. Kernel-side changes dese
 **Kernel code is different.** Anything the verifier accepts can still crash or
 leak on a kernel you did not test. State which kernels you ran it on.
 
-**Do not change the licence markers in passing.** `bpf/sslsniff.bpf.c` declares
-`SEC("license") = "GPL"` to the verifier; the LICENSE file and the SPDX headers
-currently disagree with it, and untangling that is DR-21. Leave all three alone
-unless that is the change you are making.
+**Preserve the licence boundary.** `bpf/sslsniff.bpf.c` is GPL-2.0-only and
+declares `SEC("license") = "GPL"` to the verifier. DatRail userspace source,
+build glue, and documentation are Apache-2.0. Vendored submodules retain their
+upstream licences. A file moving across that boundary needs explicit review.
 
 **The tap handles plaintext.** Anything that widens where captured data goes
 needs to be deliberate and discussed.
