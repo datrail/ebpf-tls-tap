@@ -1,0 +1,12 @@
+DatRail eBPF TLS Tap licensing
+
+DatRail-owned userspace source, build glue, and documentation are licensed
+under the Apache License, Version 2.0. See LICENSES/Apache-2.0.txt.
+
+The DatRail-owned kernel eBPF program in bpf/sslsniff.bpf.c is licensed under
+the GNU General Public License, version 2 only. See
+LICENSES/GPL-2.0-only.txt.
+
+Vendored libbpf and bpftool submodules retain their upstream licences. Their
+licence files and per-file SPDX identifiers are authoritative for those
+third-party trees.

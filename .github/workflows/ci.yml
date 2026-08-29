@@ -1,0 +1,97 @@
+# Build on every change, so a break in the BPF program surfaces on the pull
+# request rather than on somebody's laptop.
+#
+# This repository had no CI at all until 2026-08-15 — one of three publishable
+# repos with none — and its first attempted CI run found two real defects: the
+# documented package list was missing libssl-dev (bpftool's bootstrap needs
+# it), and a non-recursive submodule fetch leaves out bpftool's own nested
+# libbpf. Both are fixed alongside this file. Neither would have been found by
+# reading; both were found by building in a clean container.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_call:
+    inputs:
+      ref:
+        description: >-
+          Commit-ish to check out. A called workflow's `github.ref` is the
+          caller's, so a release path must pass the resolved tag explicitly.
+          Empty means "whatever triggered this run".
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# A PR groups by ref, so a new push supersedes the last; everything else groups
+# by SHA, so each commit keeps its own signal and cannot be evicted.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # `recursive`, not `true`. libbpf and bpftool are submodules, and bpftool
+      # carries its own nested libbpf; a one-level fetch builds libbpf and then
+      # fails on bpftool with "No rule to make target bpftool/libbpf/src/hashmap.h".
+      # Both upstreams are public, so the default token is enough.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+
+      # The same list `make install` and the README carry, kept in step by
+      # hand. clang and llvm compile the BPF object; libelf and zlib are
+      # libbpf's; libssl is bpftool's.
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang llvm gcc libelf-dev zlib1g-dev libssl-dev make pkg-config
+
+      - name: Build
+        run: make build
+
+      # The Makefile is quiet on success, so a run that "passes" without
+      # producing the binary would look identical to one that did. Say what
+      # was built and prove it is an executable.
+      - name: Verify the artifact
+        run: |
+          test -x bpf/sslsniff || { echo "bpf/sslsniff was not produced" >&2; exit 1; }
+          ls -la bpf/sslsniff
+          # The compiled BPF object must exist and be a BPF ELF, not an empty file.
+          test -s bpf/.output/sslsniff.bpf.o
+          readelf -h bpf/.output/sslsniff.bpf.o | grep -q 'Machine:.*BPF' \
+            || { echo "sslsniff.bpf.o is not a BPF object" >&2; exit 1; }
+          echo "ok: BPF object and loader both built"
+
+      # An eBPF program that compiles but cannot load is the common failure —
+      # a CO-RE relocation the runner kernel rejects, a helper the verifier
+      # refuses. Loading needs root and a real kernel; the runner has both.
+      # `--help` alone would prove nothing about the BPF side.
+      #
+      # sslsniff finds libssl.so itself, attaches, and then sits in a perf-
+      # buffer loop until signalled. So: give it two seconds. Exit 124 from
+      # `timeout` means it was still running — it loaded and attached. Exit 0
+      # is the same thing if it caught the signal cleanly. Anything else is a
+      # load or attach failure and the message will say which.
+      - name: Smoke-load the probe
+        run: |
+          # No pipe: `| head` would make $? head's, and head always succeeds,
+          # so a probe that died on load would still read as ok. Capture to a
+          # file and print it after.
+          set +e
+          sudo timeout 2 bpf/sslsniff > probe.log 2>&1
+          rc=$?
+          set -e
+          head -20 probe.log
+          case "$rc" in
+            0|124) echo "ok: probe loaded and attached (exit $rc)" ;;
+            *) echo "probe failed to load (exit $rc)" >&2; exit 1 ;;
+          esac
