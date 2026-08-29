@@ -23,7 +23,8 @@ allowed_match() {
     /home/node)
       [[ -z "$after" || "$after" == /* ]] || return 1
       case "$path" in tools/agent-environment-scanner/scan_agent_environment.py|tools/agent-environment-scanner/README.md|tools/skills-scanner/skill_scanner.py|tools/skills-scanner/README.md|nemoclaw/docker-compose.yml|openclaw/docker-compose.yml) return 0 ;; esac ;;
-    /home/agent|/home/agent/*)
+    /home/agent)
+      [[ -z "$after" || "$after" == /* ]] || return 1
       case "$path" in tests/*|tests-python/*) return 0 ;; esac ;;
     aizawa-metrics.internal)
       [[ "$path" == tools/agent-environment-scanner/scan_agent_environment.py &&
@@ -134,7 +135,26 @@ self_test() (
   check_case node-single-quote-prefix tools/agent-environment-scanner/scan_agent_environment.py "/home/node'evil" 1 'tools/agent-environment-scanner/scan_agent_environment.py:1:/home/node' || return
   check_case node-comma-prefix tools/agent-environment-scanner/scan_agent_environment.py '/home/node,evil' 1 'tools/agent-environment-scanner/scan_agent_environment.py:1:/home/node' || return
   check_case node-semicolon-prefix tools/agent-environment-scanner/scan_agent_environment.py '/home/node;evil' 1 'tools/agent-environment-scanner/scan_agent_environment.py:1:/home/node' || return
+  check_case node-root tools/agent-environment-scanner/scan_agent_environment.py '/home/node' 0 '' || return
   check_case node-path tools/agent-environment-scanner/scan_agent_environment.py '/home/node/path' 0 '' || return
+  check_case agent-concatenated tests/fixture.py '/home/agentevil/project' 1 'tests/fixture.py:1:/home/agentevil' || return
+  check_case agent-punctuation tests/fixture.py '/home/agent+evil/project' 1 'tests/fixture.py:1:/home/agent' || return
+  check_case agent-whitespace tests/fixture.py '/home/agent evil/project' 1 'tests/fixture.py:1:/home/agent' || return
+  check_case agent-at-sign tests/fixture.py '/home/agent@evil/project' 1 'tests/fixture.py:1:/home/agent' || return
+  check_case agent-root tests/fixture.py '/home/agent' 0 '' || return
+  check_case agent-path tests/fixture.py '/home/agent/project' 0 '' || return
+  check_case a-developer-root tests/fixture.py '/home/a-developer' 1 'tests/fixture.py:1:/home/a-developer' || return
+  check_case a-developer-path tests/fixture.py '/home/a-developer/project' 1 'tests/fixture.py:1:/home/a-developer' || return
+  check_case a-developer-punctuation tests/fixture.py '/home/a-developer+evil/project' 1 'tests/fixture.py:1:/home/a-developer' || return
+  check_case a-developer-whitespace tests/fixture.py '/home/a-developer evil/project' 1 'tests/fixture.py:1:/home/a-developer' || return
+  check_case a-developer-concatenated tests/fixture.py '/home/a-developerevil/project' 1 'tests/fixture.py:1:/home/a-developerevil' || return
+  for users_account in agent node a-developer; do
+    check_case "users-$users_account-root" tests/fixture.py "/Users/$users_account" 1 "tests/fixture.py:1:/Users/$users_account" || return
+    check_case "users-$users_account-path" tests/fixture.py "/Users/$users_account/project" 1 "tests/fixture.py:1:/Users/$users_account" || return
+    check_case "users-$users_account-punctuation" tests/fixture.py "/Users/$users_account+evil/project" 1 "tests/fixture.py:1:/Users/$users_account" || return
+    check_case "users-$users_account-whitespace" tests/fixture.py "/Users/$users_account evil/project" 1 "tests/fixture.py:1:/Users/$users_account" || return
+    check_case "users-$users_account-concatenated" tests/fixture.py "/Users/${users_account}evil/project" 1 "tests/fixture.py:1:/Users/${users_account}evil" || return
+  done
   check_case aizawa-context tools/agent-environment-scanner/scan_agent_environment.py 'The service is called `aizawa-metrics.internal` for compatibility.' 0 '' || return
   check_case aizawa-real tools/agent-environment-scanner/scan_agent_environment.py 'endpoint = "aizawa-metrics.internal"' 1 'tools/agent-environment-scanner/scan_agent_environment.py:1:aizawa-metrics.internal' || return
   check_case aizawa-repeated tools/agent-environment-scanner/scan_agent_environment.py 'The service is called `aizawa-metrics.internal`; endpoint="aizawa-metrics.internal"' 1 'tools/agent-environment-scanner/scan_agent_environment.py:1:aizawa-metrics.internal' || return
