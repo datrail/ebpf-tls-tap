@@ -4,7 +4,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 command -v git >/dev/null || { echo "git is required" >&2; exit 3; }
 # Match only the home root and account name. Paths may contain essentially any
 # punctuation, so consuming the tail makes one occurrence swallow the next.
-home_pattern='(/Users/(\[[^]]+\]|\$[A-Za-z_][A-Za-z0-9_]*|[[:alnum:]_.-]+)|/home/(\[[^]]+\]|\$[A-Za-z_][A-Za-z0-9_]*|[[:alnum:]_.-]+))'
+home_pattern='(/Users/(\[[^]]+\]|\$[A-Za-z_][A-Za-z0-9_]*|([[:alnum:]_.-]|[^/[:space:][:alnum:][:punct:]])+)|/home/(\[[^]]+\]|\$[A-Za-z_][A-Za-z0-9_]*|([[:alnum:]_.-]|[^/[:space:][:alnum:][:punct:]])+))'
 internal_pattern='[A-Za-z0-9.-]+\.internal(\.[A-Za-z0-9.-]+)*(:[0-9]+)?'
 pattern="($home_pattern|$internal_pattern)"
 
@@ -21,6 +21,7 @@ allowed_match() {
       case "$path" in tests/*|tests-python/*) return 0 ;; esac
       ;;
     /home/node)
+      [[ -z "$after" || "$after" == /* ]] || return 1
       case "$path" in tools/agent-environment-scanner/scan_agent_environment.py|tools/agent-environment-scanner/README.md|tools/skills-scanner/skill_scanner.py|tools/skills-scanner/README.md|nemoclaw/docker-compose.yml|openclaw/docker-compose.yml) return 0 ;; esac ;;
     /home/agent|/home/agent/*)
       case "$path" in tests/*|tests-python/*) return 0 ;; esac ;;
@@ -50,7 +51,7 @@ parse_scan_output() {
     IFS= read -r line || { echo "publication-default scan returned a partial line record" >&2; return 3; }
     : >"$matches"
     for detector in "$home_pattern" "$internal_pattern"; do
-      if printf '%s\n' "$line" | grep -b -o -i -E "$detector" >>"$matches"; then detector_rc=0; else detector_rc=$?; fi
+      if printf '%s\n' "$line" | LC_ALL=C grep -b -o -i -E "$detector" >>"$matches"; then detector_rc=0; else detector_rc=$?; fi
       (( detector_rc <= 1 )) || { echo "publication-default match extraction failed (exit $detector_rc)" >&2; return 3; }
     done
     [[ -s "$matches" ]] || { echo "publication-default match extraction returned no matches" >&2; return 3; }
@@ -70,7 +71,7 @@ scan_index() (
   trap 'rc=$?; trap - EXIT; rm -rf -- "$temporary" || rc=3; exit "$rc"' EXIT
   output="$temporary/output"
   matches="$temporary/matches"
-  if git -C "$repo" grep --cached -z -n -I -i -E "$pattern" -- ':!tools/check-publication-defaults.sh' >"$output"; then
+  if LC_ALL=C git -C "$repo" grep --cached -z -n -I -i -E "$pattern" -- ':!tools/check-publication-defaults.sh' >"$output"; then
     scan_rc=0
   else
     scan_rc=$?
@@ -84,13 +85,14 @@ scan_index() (
 )
 
 self_test() (
-  local fixture index rc output expected path content unicode_prefix
+  local fixture index rc output expected path content unicode_prefix test_locale mutation mutation_locale child_locale
   fixture=$(mktemp -d)
   trap 'rc=$?; trap - EXIT; rm -rf -- "$fixture" || rc=3; exit "$rc"' EXIT
   index="$fixture/index"
   git -C "$fixture" init -q
   mkdir -p "$fixture/tests" "$fixture/tools/agent-environment-scanner"
   printf -v unicode_prefix 'é%.0s' {1..31}
+  grep -Eq '^  if LC_ALL=C git -C "\$repo" grep ' "${BASH_SOURCE[0]}" || { echo 'scan-locale self-test failed' >&2; return 3; }
 
   check_case() {
     local name=$1 case_path=$2 case_content=$3 expected_rc=$4 expected_output=$5
@@ -119,14 +121,59 @@ self_test() (
   check_case bracket-home tests/fixture.py '/home/[private-user]/project' 1 'tests/fixture.py:1:/home/[private-user]' || return
   check_case variable-home tests/fixture.py '/home/$USER/project' 1 'tests/fixture.py:1:/home/$USER' || return
   check_case unicode-home tests/fixture.py '/home/开发者/project' 1 'tests/fixture.py:1:/home/开发者' || return
+  check_case unicode-users-home tests/fixture.py '/Users/開発者/project' 1 'tests/fixture.py:1:/Users/開発者' || return
+  check_case node-prefix tools/agent-environment-scanner/scan_agent_environment.py '/home/nodeevil/project' 1 'tools/agent-environment-scanner/scan_agent_environment.py:1:/home/nodeevil' || return
+  check_case node-space-prefix tools/agent-environment-scanner/scan_agent_environment.py '/home/node evil' 1 'tools/agent-environment-scanner/scan_agent_environment.py:1:/home/node' || return
+  check_case node-plus-prefix tools/agent-environment-scanner/scan_agent_environment.py '/home/node+evil' 1 'tools/agent-environment-scanner/scan_agent_environment.py:1:/home/node' || return
+  check_case node-at-prefix tools/agent-environment-scanner/scan_agent_environment.py '/home/node@evil' 1 'tools/agent-environment-scanner/scan_agent_environment.py:1:/home/node' || return
+  check_case node-equals-prefix tools/agent-environment-scanner/scan_agent_environment.py '/home/node=evil' 1 'tools/agent-environment-scanner/scan_agent_environment.py:1:/home/node' || return
+  check_case node-colon-prefix tools/agent-environment-scanner/scan_agent_environment.py '/home/node:evil' 1 'tools/agent-environment-scanner/scan_agent_environment.py:1:/home/node' || return
+  check_case node-bracket-prefix tools/agent-environment-scanner/scan_agent_environment.py '/home/node[evil]' 1 'tools/agent-environment-scanner/scan_agent_environment.py:1:/home/node' || return
+  check_case node-dollar-prefix tools/agent-environment-scanner/scan_agent_environment.py '/home/node$evil' 1 'tools/agent-environment-scanner/scan_agent_environment.py:1:/home/node' || return
+  check_case node-quote-prefix tools/agent-environment-scanner/scan_agent_environment.py '/home/node"evil' 1 'tools/agent-environment-scanner/scan_agent_environment.py:1:/home/node' || return
+  check_case node-single-quote-prefix tools/agent-environment-scanner/scan_agent_environment.py "/home/node'evil" 1 'tools/agent-environment-scanner/scan_agent_environment.py:1:/home/node' || return
+  check_case node-comma-prefix tools/agent-environment-scanner/scan_agent_environment.py '/home/node,evil' 1 'tools/agent-environment-scanner/scan_agent_environment.py:1:/home/node' || return
+  check_case node-semicolon-prefix tools/agent-environment-scanner/scan_agent_environment.py '/home/node;evil' 1 'tools/agent-environment-scanner/scan_agent_environment.py:1:/home/node' || return
+  check_case node-path tools/agent-environment-scanner/scan_agent_environment.py '/home/node/path' 0 '' || return
   check_case aizawa-context tools/agent-environment-scanner/scan_agent_environment.py 'The service is called `aizawa-metrics.internal` for compatibility.' 0 '' || return
   check_case aizawa-real tools/agent-environment-scanner/scan_agent_environment.py 'endpoint = "aizawa-metrics.internal"' 1 'tools/agent-environment-scanner/scan_agent_environment.py:1:aizawa-metrics.internal' || return
   check_case aizawa-repeated tools/agent-environment-scanner/scan_agent_environment.py 'The service is called `aizawa-metrics.internal`; endpoint="aizawa-metrics.internal"' 1 'tools/agent-environment-scanner/scan_agent_environment.py:1:aizawa-metrics.internal' || return
   check_case aizawa-unicode-offset tools/agent-environment-scanner/scan_agent_environment.py "${unicode_prefix}aizawa-metrics.internalcalled \`XXXXXXXXXXXXXXXXXXXXXXX\`" 1 'tools/agent-environment-scanner/scan_agent_environment.py:1:aizawa-metrics.internal' || return
+  check_case unicode-before-host tests/fixture.py 'ésecret.internal' 1 'tests/fixture.py:1:secret.internal' || return
+  check_case unicode-middle-host tests/fixture.py 'first.internalésecond.internal' 1 $'tests/fixture.py:1:first.internal\ntests/fixture.py:1:second.internal' || return
+  check_case unicode-after-host tests/fixture.py 'secret.internalé' 1 'tests/fixture.py:1:secret.internal' || return
   check_case rust-json-exact src/interaction.rs 'let v = json!("https://proxy.internal.example.com/v1/messages?beta=true"); endpoint="evil.internal.example.com";' 1 'src/interaction.rs:1:evil.internal.example.com' || return
   check_case rust-assert-exact src/interaction.rs 'assert_eq!(out["request"]["destination"], "proxy.internal.example.com"); endpoint="evil.internal.example.com";' 1 'src/interaction.rs:1:evil.internal.example.com' || return
   check_case allowed tests/fixture.py 'host.docker.internal:8080 api.internal.example.com /home/agent' 0 '' || return
   check_case negative tests/fixture.py 'https://service.example.com /opt/app' 0 '' || return
+
+  for test_locale in C C.utf8 en_US.utf8 POSIX; do
+    locale -a | grep -Fxiq "$test_locale" || continue
+    LC_ALL="$test_locale" check_case "locale-$test_locale-unicode-home" tests/fixture.py '/home/开发者/project' 1 'tests/fixture.py:1:/home/开发者' || return
+    LC_ALL="$test_locale" check_case "locale-$test_locale-byte-offset" tools/agent-environment-scanner/scan_agent_environment.py 'éThe service is called `aizawa-metrics.internal`; éendpoint="aizawa-metrics.internal"' 1 'tools/agent-environment-scanner/scan_agent_environment.py:1:aizawa-metrics.internal' || return
+  done
+
+  if [[ -z "${PUBLICATION_DEFAULT_MUTATION_CHILD:-}" ]]; then
+    mutation_locale=
+    for test_locale in en_US.utf8 en_US.UTF-8; do
+      locale -a | grep -Fxiq "$test_locale" && { mutation_locale=$test_locale; break; }
+    done
+    for mutation in scan-locale locale unicode offset; do
+      child_locale=C
+      case "$mutation" in locale|offset)
+        [[ -n "$mutation_locale" ]] || continue
+        child_locale=$mutation_locale
+      esac
+      case "$mutation" in
+        scan-locale) sed '/^  if LC_ALL=C git -C/s/LC_ALL=C //' "${BASH_SOURCE[0]}" >"$fixture/tools/check-publication-defaults.sh" ;;
+        locale) sed 's/LC_ALL=C grep -b/grep -b/' "${BASH_SOURCE[0]}" >"$fixture/tools/check-publication-defaults.sh" ;;
+        unicode) sed 's/(\[\[:alnum:\]_.-\]|\[\^\/\[:space:\]\[:alnum:\]\[:punct:\]\])+/[[:alnum:]_.-]+/g' "${BASH_SOURCE[0]}" >"$fixture/tools/check-publication-defaults.sh" ;;
+        offset) sed 's/local LC_ALL=C path=/local path=/' "${BASH_SOURCE[0]}" >"$fixture/tools/check-publication-defaults.sh" ;;
+      esac
+      if output=$(PUBLICATION_DEFAULT_MUTATION_CHILD=1 LC_ALL="$child_locale" bash "$fixture/tools/check-publication-defaults.sh" 2>&1); then rc=0; else rc=$?; fi
+      [[ $rc -eq 3 && "$output" == *'self-test failed'* ]] || { printf '%s mutation self-test failed (exit %s, output %q)\n' "$mutation" "$rc" "$output" >&2; return 3; }
+    done
+  fi
 
   GIT_INDEX_FILE="$index" git -C "$fixture" read-tree --empty
   printf '%s\n' 'secret.internal' >"$fixture/tests/fixture.py"
