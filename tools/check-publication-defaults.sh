@@ -75,6 +75,6 @@ self_test() {
 }
 
 self_test
-# git grep searches the index by default: only tracked content can be published.
+# Scan the index explicitly: only staged tracked content can be published.
 scan_index "$root"
 echo "publication-default scan passed"
