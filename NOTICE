@@ -1,0 +1,28 @@
+eBPF TLS Tap
+Copyright (c) 2026 DatRail
+
+This product is part of the DatRail open-source agent-security toolchain
+(https://github.com/datrail).
+
+DatRail-owned userspace source, build glue, and documentation are distributed
+under Apache-2.0. The DatRail-owned kernel eBPF program is GPL-2.0-only. See
+LICENSE and LICENSES/ for the ratified boundary.
+
+--------------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------------
+
+libbpf — https://github.com/libbpf/libbpf
+    Vendored. LGPL-2.1 OR BSD-2-Clause.
+
+bpftool — https://github.com/libbpf/bpftool
+    Vendored, used at build time to generate skeletons and vmlinux.h.
+
+BCC sslsniff — https://github.com/iovisor/bcc
+    The probe approach and original sslsniff implementation are derived from
+    BCC's Apache-2.0-licensed tool of the same name.
+
+AgentSight — https://github.com/eunomia-bpf/agentsight
+    AgentSight carries the same BCC/eBPF TLS-capture lineage and is the runtime
+    capture implementation consumed by RailMon. It is named here for lineage;
+    AgentSight source is not vendored in this repository.
