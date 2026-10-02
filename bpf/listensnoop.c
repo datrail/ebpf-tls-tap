@@ -3,7 +3,9 @@
 //
 // Print one JSON line for every socket that starts accepting inbound traffic
 // (a TCP socket entering LISTEN, a datagram socket binding a port, or one
-// bound by its first sendto()), and a "lost" line for any event dropped.
+// bound by its first sendto()), one for each new remote address a TCP
+// listener accepts a connection from, and a "lost" line for any event
+// dropped.
 #include <argp.h>
 #include <arpa/inet.h>
 #include <bpf/bpf.h>
@@ -49,7 +51,10 @@ const char argp_program_doc[] =
 	"Prints one JSON object per line: a TCP socket entering LISTEN\n"
 	"(\"kind\":\"listen\"), a UDP or ICMP-echo socket binding a port\n"
 	"(\"kind\":\"bind\"), or an unbound one's first sendto()\n"
-	"(\"kind\":\"autobind\"). A \"kind\":\"lost\" line means events were\n"
+	"(\"kind\":\"autobind\"). The first connection a process accepts from\n"
+	"each remote address on each listening port prints \"kind\":\"peer\",\n"
+	"with the listener's address and port and the remote one as \"peer\".\n"
+	"A \"kind\":\"lost\" line means events were\n"
 	"dropped. Sockets already listening when it starts are not reported.\n"
 	"PIDs, and -p, are as listensnoop's own PID namespace sees them; a\n"
 	"process it cannot see has pid 0 and only its host_pid, or is left out\n"
@@ -182,6 +187,8 @@ static const char *kind_name(__u8 kind)
 		return "autobind";
 	case LISTEN_KIND_LISTEN:
 		return "listen";
+	case LISTEN_KIND_PEER:
+		return "peer";
 	default:
 		return "unknown";
 	}
@@ -230,9 +237,21 @@ static int handle_event(void *ctx, void *data, size_t data_size)
 		printf(",\"protocol\":\"%s\"", proto);
 	else
 		printf(",\"protocol\":\"%u\"", e->protocol);
-	printf(",\"family\":\"%s\",\"addr\":\"%s\",\"port\":%u,\"ephemeral\":%s}\n",
+	printf(",\"family\":\"%s\",\"addr\":\"%s\",\"port\":%u,\"ephemeral\":%s",
 	       af == AF_INET6 ? "ipv6" : "ipv4", addr, e->port,
 	       e->ephemeral ? "true" : "false");
+	if (e->kind == LISTEN_KIND_PEER) {
+		static const __u8 v4mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+		/* An IPv4 client of a dual-stack listener is the IPv4 address it
+		 * is, not ::ffff:a.b.c.d, so one client reads the same either way. */
+		bool mapped = af == AF_INET6 && !memcmp(e->peer, v4mapped, sizeof(v4mapped));
+
+		if (!inet_ntop(mapped ? AF_INET : af, mapped ? e->peer + 12 : e->peer,
+			       addr, sizeof(addr)))
+			addr[0] = 0;
+		printf(",\"peer\":\"%s\"", addr);
+	}
+	printf("}\n");
 	fflush(stdout);
 	return 0;
 }
