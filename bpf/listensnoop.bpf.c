@@ -102,6 +102,9 @@ const volatile uid_t targ_uid = -1;
  * namespace sees them, so they mean what they mean to the user and to -p
  * whether it runs on the host or in a container. */
 const volatile __u32 pidns_ino = 0;
+/* --own-namespace: drop events from processes listensnoop's namespace cannot
+ * see, rather than report them with pid 0. */
+const volatile bool own_ns_only = false;
 
 /* p's number in listensnoop's PID namespace: 0 if p is not visible there. */
 static __always_inline u32 nr_in_ns(struct pid *p)
@@ -189,6 +192,8 @@ static __always_inline void emit(void *ctx, struct sock *sk, u8 kind, bool ephem
     u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
 
     ns_pid_tid(&pid, &tid);
+    if (own_ns_only && !pid)
+        return;
     if (targ_pid && targ_pid != pid)
         return;
     if (targ_uid != (uid_t)-1 && targ_uid != uid)

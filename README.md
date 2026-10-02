@@ -75,6 +75,17 @@ One JSON object per line, one line per socket:
   get the PIDs you see there, and a process outside the container's namespace
   has `pid` 0 and only `host_pid`. `uid` is the kernel's (initial user
   namespace) view.
+- `-n` (`--own-namespace`) leaves processes listensnoop's PID namespace
+  cannot see out, in the kernel, instead of reporting them with `pid` 0. Run
+  in an agent's namespace, it records that namespace and any nested in it.
+- Each attach prints `{"kind":"start","time":...,"every":N}`. `-H SECONDS`
+  (`--heartbeat`) adds an `alive` line of the same shape about every N
+  seconds, scheduled on the monotonic clock and stamped in wall-clock UTC.
+  A consumer can then tell a quiet probe from a stopped one, and see a
+  restart: the probe does not report sockets already listening when it
+  attaches, so anything opened while it was down is missing. A process that
+  shares the probe's PID namespace can signal it, so these records matter
+  there.
 - Not covered:
   - sockets already listening when it starts (read `/proc/net/{tcp,udp}{,6}`
     for those);

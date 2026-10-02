@@ -32,6 +32,8 @@ static struct env {
 	pid_t pid;
 	uid_t uid;
 	bool verbose;
+	bool own_namespace;
+	long heartbeat; /* seconds; 0 is off */
 } env = {
 	.uid = INVALID_UID,
 	.pid = INVALID_PID,
@@ -42,7 +44,7 @@ const char *argp_program_bug_address = "https://github.com/datrail/ebpf-tls-tap/
 const char argp_program_doc[] =
 	"Report sockets that start accepting inbound traffic.\n"
 	"\n"
-	"USAGE: listensnoop [-h] [-p PID] [-u UID] [-v]\n"
+	"USAGE: listensnoop [-h] [-p PID] [-u UID] [-n] [-H SECONDS] [-v]\n"
 	"\n"
 	"Prints one JSON object per line: a TCP socket entering LISTEN\n"
 	"(\"kind\":\"listen\"), a UDP or ICMP-echo socket binding a port\n"
@@ -50,7 +52,11 @@ const char argp_program_doc[] =
 	"(\"kind\":\"autobind\"). A \"kind\":\"lost\" line means events were\n"
 	"dropped. Sockets already listening when it starts are not reported.\n"
 	"PIDs, and -p, are as listensnoop's own PID namespace sees them; a\n"
-	"process it cannot see has pid 0 and only its host_pid.\n"
+	"process it cannot see has pid 0 and only its host_pid, or is left out\n"
+	"with -n. A \"kind\":\"start\" line marks each attach; with -H, a\n"
+	"\"kind\":\"alive\" line follows about every SECONDS. Both carry the\n"
+	"wall-clock time, so a consumer can tell a quiet probe from a stopped or\n"
+	"restarted one.\n"
 	"\n"
 	"EXAMPLES:\n"
 	"    ./listensnoop           # every new listening socket\n"
@@ -59,6 +65,8 @@ const char argp_program_doc[] =
 static const struct argp_option opts[] = {
 	{"pid", 'p', "PID", 0, "Trace this PID only."},
 	{"uid", 'u', "UID", 0, "Trace this UID only."},
+	{"own-namespace", 'n', NULL, 0, "Leave out processes outside listensnoop's PID namespace."},
+	{"heartbeat", 'H', "SECONDS", 0, "Print an alive line every SECONDS."},
 	{"verbose", 'v', NULL, 0, "Verbose libbpf debug output."},
 	{NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help"},
 	{},
@@ -75,6 +83,18 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		break;
 	case 'v':
 		env.verbose = true;
+		break;
+	case 'n':
+		env.own_namespace = true;
+		break;
+	case 'H':
+		errno = 0;
+		val = strtol(arg, &end, 10);
+		if (errno || *end || val < 1 || val > 86400) {
+			fprintf(stderr, "invalid heartbeat: %s (1..86400 seconds)\n", arg);
+			argp_usage(state);
+		}
+		env.heartbeat = val;
 		break;
 	case 'p':
 	case 'u':
@@ -165,6 +185,26 @@ static const char *kind_name(__u8 kind)
 	default:
 		return "unknown";
 	}
+}
+
+/* Wall-clock, not the events' boot-relative timestamp_ns: the consumer
+ * compares it with its own clock to see whether the probe is still running.
+ * `kind` is "start" once, at attach, and "alive" for each heartbeat. A
+ * consumer that sees two starts knows the probe was down in between: it
+ * does not report sockets already listening when it attaches, so whatever
+ * opened in that gap is missing. */
+static void print_alive(const char *kind)
+{
+	char stamp[32];
+	struct tm tm;
+	time_t now = time(NULL);
+
+	if (!gmtime_r(&now, &tm) ||
+	    !strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%SZ", &tm))
+		return;
+	printf("{\"kind\":\"%s\",\"time\":\"%s\",\"every\":%ld}\n",
+	       kind, stamp, env.heartbeat);
+	fflush(stdout);
 }
 
 static int handle_event(void *ctx, void *data, size_t data_size)
@@ -267,7 +307,7 @@ int main(int argc, char **argv)
 	struct listensnoop_bpf *obj = NULL;
 	struct ring_buffer *rb = NULL;
 	__u64 drops_reported = 0;
-	struct timespec now, last_report = {};
+	struct timespec now, last_report = {}, last_alive = {};
 	struct stat ns;
 	int err;
 
@@ -291,6 +331,7 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 	obj->rodata->pidns_ino = ns.st_ino;
+	obj->rodata->own_ns_only = env.own_namespace;
 	/* One bind hook per family, never both: inet_bind calls inet_bind_sk,
 	 * so attaching both would report every bind twice. From 6.6, MPTCP's
 	 * binds reach only the _sk form; before, there is no _sk form and they
@@ -343,6 +384,8 @@ int main(int argc, char **argv)
 
 	/* Stdout carries only events; readiness goes to stderr. */
 	fprintf(stderr, "listensnoop: attached\n");
+	print_alive("start");
+	clock_gettime(CLOCK_MONOTONIC, &last_alive);
 
 	while (!exiting) {
 		err = ring_buffer__poll(rb, POLL_TIMEOUT_MS);
@@ -355,6 +398,12 @@ int main(int argc, char **argv)
 		/* Poll returns as soon as anything is queued, so under load this
 		 * loop spins; one "lost" line per interval is enough. */
 		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (env.heartbeat &&
+		    (now.tv_sec - last_alive.tv_sec) * 1000 +
+		    (now.tv_nsec - last_alive.tv_nsec) / 1000000 >= env.heartbeat * 1000) {
+			print_alive("alive");
+			last_alive = now;
+		}
 		if ((now.tv_sec - last_report.tv_sec) * 1000 +
 		    (now.tv_nsec - last_report.tv_nsec) / 1000000 < POLL_TIMEOUT_MS)
 			continue;
