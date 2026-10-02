@@ -28,10 +28,13 @@ it failed:
 
 Usage: sudo python3 tests/listensnoop_test.py [path/to/listensnoop]
 """
+import calendar
 import json
 import os
 import select
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -252,16 +255,21 @@ print(s.getsockname()[1], flush=True)
 """
 
 
-def start_snoop(*args, read=True):
+def start_snoop(*args, read=True, prefix=()):
     """Start listensnoop and wait until it is attached. With read=False its
-    stdout is left unread until stop_snoop, so the pipe fills and it stalls."""
-    proc = subprocess.Popen([BINARY, *args], stdout=subprocess.PIPE,
+    stdout is left unread until stop_snoop, so the pipe fills and it stalls.
+    A prefix such as `unshare --pid --fork` runs it in a new namespace."""
+    proc = subprocess.Popen([*prefix, BINARY, *args], stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE)
+    proc.forked = bool(prefix)
     proc.lines = []
     proc.reader = None
     if read:
+        # A daemon, so a test that fails with a snoop still running exits
+        # instead of waiting on this thread forever.
         proc.reader = threading.Thread(
-            target=lambda: proc.lines.extend(proc.stdout.read().decode().splitlines()))
+            target=lambda: proc.lines.extend(proc.stdout.read().decode().splitlines()),
+            daemon=True)
         proc.reader.start()
     # Raw reads, not readline(): a buffered reader can swallow the "attached"
     # line along with an earlier warning, and select() never fires again.
@@ -286,9 +294,16 @@ def start_snoop(*args, read=True):
              f"{(seen + rest).decode(errors='replace')}")
 
 
-def stop_snoop(proc):
+def stop_snoop(proc, markers=False):
+    """Stop listensnoop and return its records: events and lost lines, plus
+    its start and alive lines only when `markers` asks for them."""
     time.sleep(1)  # let the ring buffer drain the last events
-    proc.terminate()
+    if proc.forked:
+        # `unshare --fork` does not forward signals: stop listensnoop itself.
+        with open(f"/proc/{proc.pid}/task/{proc.pid}/children") as f:
+            os.kill(int(f.read().split()[0]), signal.SIGTERM)
+    else:
+        proc.terminate()
     if proc.reader:
         try:
             proc.wait(timeout=10)
@@ -311,6 +326,8 @@ def stop_snoop(proc):
             events.append(json.loads(line))
         except json.JSONDecodeError:
             sys.exit(f"listensnoop printed a non-JSON line: {line!r}")
+    if not markers:
+        events = [e for e in events if e.get("kind") not in ("start", "alive")]
     return events
 
 
@@ -396,6 +413,40 @@ def main():
           "-p reports only that PID")
     check(sorted(key(e) for e in filtered_events) == expected,
           "-p still reports every event of that PID")
+
+    # -n and -H (DR-143), from inside a new PID namespace: this test's own
+    # process is outside it, so its listener is pid 0 to an unfiltered run
+    # and absent with -n; -H prints wall-clock alive lines meanwhile.
+    if shutil.which("unshare"):
+        own = start_snoop("-n", "-H", "1", prefix=("unshare", "--pid", "--fork"))
+        unfiltered = start_snoop(prefix=("unshare", "--pid", "--fork"))
+        outside = socket.socket()
+        outside.bind(("127.0.0.1", 0))
+        outside.listen()
+        port = outside.getsockname()[1]
+        time.sleep(2.5)
+        started = time.time()
+        own_events = stop_snoop(own, markers=True)
+        unfiltered_events = stop_snoop(unfiltered, markers=True)
+        outside.close()
+        check(any(e.get("port") == port and e["pid"] == 0 for e in unfiltered_events),
+              "without -n, a process outside the namespace is reported as pid 0")
+        check(not any(e.get("port") == port for e in own_events),
+              "-n leaves it out")
+        def utc(stamp):  # timegm, not mktime: the stamp is UTC, not local time
+            return calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ"))
+        alive = [e for e in own_events if e["kind"] == "alive"]
+        starts = [e for e in own_events if e["kind"] == "start"]
+        check(len(alive) >= 2 and all(
+            e["every"] == 1 and abs(utc(e["time"]) - started) < 60 for e in alive),
+              f"-H 1 prints wall-clock alive lines ({len(alive)} in ~3.5s)")
+        check(len(starts) == 1 and starts[0]["every"] == 1 and abs(utc(starts[0]["time"]) - started) < 60,
+              "one start record at attach")
+        check(not any(e["kind"] == "alive" for e in unfiltered_events)
+              and [e["every"] for e in unfiltered_events if e["kind"] == "start"] == [0],
+              "and without -H, a start record but no alive lines")
+    else:
+        print("note: no unshare here; -n and -H cases skipped")
 
     stress = os.path.join(tempfile.mkdtemp(), "bind_stress")
     subprocess.run(["cc", "-O2", "-pthread", "-o", stress,
