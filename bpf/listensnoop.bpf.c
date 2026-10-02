@@ -10,8 +10,11 @@
 //   never for a repeated listen() that merely resizes the backlog, so each
 //   listening socket is reported once. It also covers listen() with no prior
 //   bind(), where the kernel picks the port here.
-// - inet_bind/inet6_bind(sock, ...) are the AF_INET/AF_INET6 bind() entry
-//   points. TCP binds are skipped (the listen hook reports the ones that
+// - inet_bind_sk/inet6_bind_sk(sk, ...) are where every AF_INET/AF_INET6
+//   bind() lands since Linux 6.6, MPTCP's included: it binds its subflow
+//   there directly, bypassing inet_bind. Before 6.6 they don't exist and
+//   every bind, MPTCP's too, goes through inet_bind/inet6_bind; the loader
+//   attaches exactly one of each pair. TCP binds are skipped (the listen hook reports the ones that
 //   become servers); a UDP bind is the only signal a UDP server gives, since
 //   UDP has no listen(). An unprivileged ICMP "ping" socket (SOCK_DGRAM,
 //   IPPROTO_ICMP) binds an echo identifier the same way and then receives
@@ -33,7 +36,11 @@
 // arguments this kernel's version of the function takes.
 //
 // Address and port are read on return, after the kernel assigned them, so a
-// bind to port 0 reports the port actually chosen.
+// bind to port 0 reports the port actually chosen, and the event says whether
+// the kernel chose it (ephemeral): a bind that asked for port 0, a listen()
+// on an unbound socket, or an autobind. A consumer comparing listeners over
+// time needs that, since a chosen port differs on every run while an asked-for
+// one is the service's identity, whatever range it falls in.
 #include <vmlinux.h>
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
@@ -75,6 +82,19 @@ struct {
     __type(key, int);
     __type(value, __u64);
 } unbound_send SEC(".maps");
+
+/* Whether the kernel picked the socket's current port: written on every
+ * successful bind() (1 if it asked for port 0, else 0) and set by listen()
+ * on a socket with no port. Never only set: a kernel-chosen port is released
+ * when the socket disconnects (connect(AF_UNSPEC)), and the same socket can
+ * then bind a port it asks for, which must not read as ephemeral. Read when
+ * the socket starts listening; lives and dies with the socket. */
+struct {
+    __uint(type, BPF_MAP_TYPE_SK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, int);
+    __type(value, __u8);
+} kernel_chose SEC(".maps");
 
 const volatile pid_t targ_pid = 0;
 const volatile uid_t targ_uid = -1;
@@ -137,7 +157,32 @@ static __always_inline void count_drop(void)
         __sync_fetch_and_add(drops, 1);
 }
 
-static __always_inline void emit(void *ctx, struct sock *sk, u8 kind)
+static __always_inline void mark_kernel_chose(struct sock *sk, bool chose)
+{
+    __u8 *flag;
+
+    if (!chose) {
+        /* Only clear an existing mark; no mark already reads as asked-for. */
+        flag = bpf_sk_storage_get(&kernel_chose, sk, 0, 0);
+        if (flag)
+            *flag = 0;
+        return;
+    }
+    flag = bpf_sk_storage_get(&kernel_chose, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
+    if (flag)
+        *flag = 1;
+    else
+        count_drop(); /* out of memory: the port would read as asked-for */
+}
+
+static __always_inline bool kernel_chose_port(struct sock *sk)
+{
+    __u8 *flag = bpf_sk_storage_get(&kernel_chose, sk, 0, 0);
+
+    return flag && *flag;
+}
+
+static __always_inline void emit(void *ctx, struct sock *sk, u8 kind, bool ephemeral)
 {
     struct listen_event_t *e;
     u32 pid, tid, uid = bpf_get_current_uid_gid();
@@ -168,6 +213,7 @@ static __always_inline void emit(void *ctx, struct sock *sk, u8 kind)
     e->port = BPF_CORE_READ(sk, __sk_common.skc_num);
     e->protocol = sk_protocol(sk);
     e->kind = kind;
+    e->ephemeral = ephemeral;
     e->timestamp_ns = bpf_ktime_get_ns();
     e->host_pid = bpf_get_current_pid_tgid() >> 32;
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
@@ -181,38 +227,65 @@ static __always_inline bool succeeded(void *ctx)
     return bpf_get_func_ret(ctx, &ret) == 0 && (int)ret == 0;
 }
 
+/* listen() on a socket with no port: the kernel picks one in here. */
+SEC("fentry/inet_csk_listen_start")
+int BPF_PROG(listen_start_enter, struct sock *sk)
+{
+    if (!sk->__sk_common.skc_num)
+        mark_kernel_chose(sk, true);
+    return 0;
+}
+
 SEC("fexit/inet_csk_listen_start")
 int BPF_PROG(listen_start_exit, struct sock *sk)
 {
     if (succeeded(ctx))
-        emit(ctx, sk, LISTEN_KIND_LISTEN);
+        emit(ctx, sk, LISTEN_KIND_LISTEN, kernel_chose_port(sk));
     return 0;
 }
 
-static __always_inline int bind_exit(void *ctx, struct socket *sock)
+static __always_inline int bind_exit(void *ctx, struct sock *sk)
 {
-    struct sock *sk;
+    __u64 uaddr = 0;
+    __be16 asked = 0;
 
-    if (!succeeded(ctx))
+    if (!sk || !succeeded(ctx))
         return 0;
-    sk = BPF_CORE_READ(sock, sk);
+    /* The port bind() asked for: sin_port and sin6_port share offset 2. */
+    if (bpf_get_func_arg(ctx, 1, &uaddr) ||
+        bpf_probe_read_kernel(&asked, sizeof(asked), (void *)uaddr + 2))
+        return 0;
+    mark_kernel_chose(sk, !asked); /* read by a TCP socket's later listen() */
     /* IP_BIND_ADDRESS_NO_PORT binds an address but no port yet; the first
      * sendto() reports it as an autobind once it has one. */
-    if (sk && is_datagram(sk) && BPF_CORE_READ(sk, __sk_common.skc_num))
-        emit(ctx, sk, LISTEN_KIND_BIND);
+    if (is_datagram(sk) && BPF_CORE_READ(sk, __sk_common.skc_num))
+        emit(ctx, sk, LISTEN_KIND_BIND, !asked);
     return 0;
 }
 
+SEC("fexit/inet_bind_sk")
+int BPF_PROG(inet_bind_sk_exit, struct sock *sk)
+{
+    return bind_exit(ctx, sk);
+}
+
+SEC("fexit/inet6_bind_sk")
+int BPF_PROG(inet6_bind_sk_exit, struct sock *sk)
+{
+    return bind_exit(ctx, sk);
+}
+
+/* Kernels before 6.6, which have no inet_bind_sk: every bind comes here. */
 SEC("fexit/inet_bind")
 int BPF_PROG(inet_bind_exit, struct socket *sock)
 {
-    return bind_exit(ctx, sock);
+    return bind_exit(ctx, sock->sk);
 }
 
 SEC("fexit/inet6_bind")
 int BPF_PROG(inet6_bind_exit, struct socket *sock)
 {
-    return bind_exit(ctx, sock);
+    return bind_exit(ctx, sock->sk);
 }
 
 SEC("fentry/inet_send_prepare")
@@ -242,7 +315,7 @@ int BPF_PROG(send_prepare_exit, struct sock *sk)
         return 0;
     *slot = 0;
     if (succeeded(ctx) && BPF_CORE_READ(sk, __sk_common.skc_num))
-        emit(ctx, sk, LISTEN_KIND_AUTOBIND);
+        emit(ctx, sk, LISTEN_KIND_AUTOBIND, true);
     return 0;
 }
 
