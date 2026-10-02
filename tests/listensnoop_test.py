@@ -292,6 +292,13 @@ b = listener(socket.AF_INET, "127.0.0.1")
 connect(b)                           # the same peer on another port: an event
 accept_all(b, 1)
 expected.append(("127.0.0.1", b.getsockname()[1], "127.0.0.1"))
+b2 = socket.socket()                 # the same port on another address: a
+b2.bind(("127.0.0.3", b.getsockname()[1]))  # different listener, so an event
+b2.listen()
+keep.append(b2)
+connect(b2)
+accept_all(b2, 1)
+expected.append(("127.0.0.3", b.getsockname()[1], "127.0.0.1"))
 
 # 32 connections from one peer accepted by 8 threads at once: still one.
 r = listener(socket.AF_INET, "127.0.0.1")
@@ -500,19 +507,21 @@ def main():
         print("note: no IPv6 on this host; dual-stack peer cases skipped")
     want = sorted(tuple(e) for e in peers["expected"])
     peer_events = [e for e in stop_snoop(everything) if e["kind"] == "peer"]
-    filtered_peers = stop_snoop(filtered)
+    filtered_all = [e for e in stop_snoop(filtered) if e["kind"] != "lost"]
+    filtered_peers = [e for e in filtered_all if e["kind"] == "peer"]
     got = sorted((e["addr"], e["port"], e["peer"]) for e in peer_events if e["pid"] == server.pid)
     check(got == want,
           f"one peer event per remote address per listening port, none for an "
           f"unaccepted connection\n      missing    {sorted(set(want) - set(got))}"
           f"\n      unexpected {sorted(set(got) - set(want))}\n      all {got}")
-    check(all(e["protocol"] == "tcp" and e["ephemeral"] is True
+    # Every listener's port was the kernel's choice but 127.0.0.3's, which
+    # asked for the port another listener had been given.
+    check(all(e["protocol"] == "tcp" and e["ephemeral"] is (e["addr"] != "127.0.0.3")
               and e["family"] == ("ipv6" if e["addr"] == "::" else "ipv4")
               for e in peer_events if e["pid"] == server.pid),
           "peer events carry the listener's protocol, family and ephemeral flag")
-    check(sorted((e["addr"], e["port"], e["peer"]) for e in filtered_peers
-                 if e["kind"] == "peer") == want
-          and all(e["pid"] == server.pid for e in filtered_peers),
+    check(sorted((e["addr"], e["port"], e["peer"]) for e in filtered_peers) == want
+          and all(e["pid"] == server.pid for e in filtered_all),
           "-p reports that server's peers and nothing else")
 
     # -n and -H (DR-143), from inside a new PID namespace: this test's own
@@ -541,8 +550,9 @@ def main():
         check(len(alive) >= 2 and all(
             e["every"] == 1 and abs(utc(e["time"]) - started) < 60 for e in alive),
               f"-H 1 prints wall-clock alive lines ({len(alive)} in ~3.5s)")
-        check(len(starts) == 1 and starts[0]["every"] == 1 and abs(utc(starts[0]["time"]) - started) < 60,
-              "one start record at attach")
+        check(len(starts) == 1 and starts[0]["every"] == 1 and abs(utc(starts[0]["time"]) - started) < 60
+              and starts[0].get("peers") is True,
+              "one start record at attach, saying it reports peers")
         check(not any(e["kind"] == "alive" for e in unfiltered_events)
               and [e["every"] for e in unfiltered_events if e["kind"] == "start"] == [0],
               "and without -H, a start record but no alive lines")

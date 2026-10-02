@@ -209,7 +209,9 @@ static void print_alive(const char *kind)
 	if (!gmtime_r(&now, &tm) ||
 	    !strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%SZ", &tm))
 		return;
-	printf("{\"kind\":\"%s\",\"time\":\"%s\",\"every\":%ld}\n",
+	/* "peers": this probe reports accepted peers, so a consumer can tell
+	 * "nobody connected" from a probe too old to say. */
+	printf("{\"kind\":\"%s\",\"time\":\"%s\",\"every\":%ld,\"peers\":true}\n",
 	       kind, stamp, env.heartbeat);
 	fflush(stdout);
 }

@@ -100,15 +100,19 @@ struct {
     __type(value, __u8);
 } kernel_chose SEC(".maps");
 
-/* Peers already reported: one event per (process, listener port, remote
+/* Peers already reported: one event per (process, listener, remote
  * address), so a busy server costs an event per new peer, not one per
  * connection. LRU, so it can't fill: an evicted peer is only reported again
- * when it next connects, which a consumer that keeps a set absorbs, and
- * nothing new is ever hidden. */
+ * when it next connects, which a consumer that keeps a set absorbs. The
+ * process is its host PID plus its start time and comm, so a reused PID or
+ * an exec() into another program is a new process, whose peers are new. */
 struct peer_key {
-    __u32 tgid; /* host PID: stable whatever namespace listensnoop is in */
+    __u64 start_time; /* the thread group leader's, in ns since boot */
+    __u32 tgid;       /* host PID: stable whatever namespace listensnoop is in */
     __u16 family;
     __u16 port;
+    char comm[LISTEN_COMM_LEN];
+    __u8 addr[16];    /* the listener's: two on one port are two listeners */
     __u8 peer[16];
 };
 
@@ -360,10 +364,12 @@ int BPF_PROG(send_prepare_exit, struct sock *sk)
 }
 
 /* accept() and every other way of taking a connection off a TCP listener's
- * queue (accept4, io_uring, MPTCP's subflow) returns the new socket here, in
- * the context of the process taking it: the one serving the peer. The
- * handshake itself completes in softirq, with no process to attribute it
- * to, so a connection nobody accepts is not reported. Address, port and
+ * queue (accept4, io_uring, MPTCP's first subflow) returns the new socket
+ * here, in the context of the process taking it: the one serving the peer.
+ * The handshake itself completes in softirq, with no process to attribute it
+ * to, so a connection nobody accepts is not reported, and neither is an
+ * MPTCP join: a later subflow, possibly from another address, that the
+ * kernel adds to an accepted connection without another accept. Address, port and
  * family are the listener's, so a consumer can join the peer to the listener
  * it reported; on a dual-stack IPv6 listener an IPv4 peer is IPv4-mapped. */
 #define EEXIST 17
@@ -385,9 +391,16 @@ int BPF_PROG(accept_exit, struct sock *sk)
     family = BPF_CORE_READ(sk, __sk_common.skc_family);
     if (!wanted(family, &pid, &tid, &uid))
         return 0;
+    key.start_time = BPF_CORE_READ((struct task_struct *)bpf_get_current_task(),
+                                   group_leader, start_time);
     key.tgid = bpf_get_current_pid_tgid() >> 32;
     key.family = family;
     key.port = BPF_CORE_READ(sk, __sk_common.skc_num);
+    bpf_get_current_comm(&key.comm, sizeof(key.comm));
+    if (family == AF_INET)
+        BPF_CORE_READ_INTO((__be32 *)key.addr, sk, __sk_common.skc_rcv_saddr);
+    else
+        BPF_CORE_READ_INTO((struct in6_addr *)key.addr, sk, __sk_common.skc_v6_rcv_saddr);
     /* Into a field of the source's own type: BPF_CORE_READ_INTO copies
      * sizeof(*dst), and 16 bytes from skc_daddr run on into the client's
      * port, which would make every connection a new peer. */

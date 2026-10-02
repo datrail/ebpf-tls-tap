@@ -57,15 +57,18 @@ One JSON object per line, one line per socket or new peer:
   A `connect()` is not reported, since a connected socket only hears its peer.
 - `"kind":"peer"`: a process accepted a TCP connection from a remote address
   (`inet_csk_accept`, which every `accept()`, `accept4()` and io_uring accept
-  reaches) for the first time on that listening port. `addr`, `port`,
+  reaches) for the first time on that listener. `addr`, `port`,
   `family` and `ephemeral` are the listener's, so a peer joins to the
   `listen` event it belongs to; `peer` is the remote address, with an IPv4
   client of a dual-stack IPv6 listener written as plain IPv4. The kernel
-  remembers which (process, port, peer) it has reported, so a busy server
-  costs one event per new peer, not one per connection. That memory is a
-  16,384-entry LRU: past that, an old peer can be reported again, but a new
-  one is never held back. A connection nobody accepts is not reported, and
-  neither are UDP senders (UDP has no accept). Behind NAT or a proxy, `peer`
+  remembers which (process, listener, peer) it has reported, so a busy server
+  costs one event per new peer, not one per connection. A process is its
+  host PID, start time and `comm`, so a reused PID or an `exec()` starts
+  afresh. That memory is a 16,384-entry LRU: past that, an old peer can be
+  reported again. A connection nobody accepts is not reported, and neither
+  are UDP senders (UDP has no accept) or MPTCP joins (a later subflow,
+  possibly from another address, added to an accepted connection without
+  another accept). Behind NAT or a proxy, `peer`
   is the last hop (for a Docker published port with the userland proxy, the
   bridge gateway), not the original client.
 - `"kind":"lost","count":N`: up to N events were missed. The count includes
@@ -96,7 +99,9 @@ One JSON object per line, one line per socket or new peer:
 - `-n` (`--own-namespace`) leaves processes listensnoop's PID namespace
   cannot see out, in the kernel, instead of reporting them with `pid` 0. Run
   in an agent's namespace, it records that namespace and any nested in it.
-- Each attach prints `{"kind":"start","time":...,"every":N}`. `-H SECONDS`
+- Each attach prints `{"kind":"start","time":...,"every":N,"peers":true}`;
+  `peers` says this version reports `peer` events, so a consumer can tell
+  "nobody connected" from a probe too old to report it. `-H SECONDS`
   (`--heartbeat`) adds an `alive` line of the same shape about every N
   seconds, scheduled on the monotonic clock and stamped in wall-clock UTC.
   A consumer can then tell a quiet probe from a stopped one, and see a
@@ -109,6 +114,7 @@ One JSON object per line, one line per socket or new peer:
     for those);
   - SCTP;
   - raw and packet sockets;
+  - additional MPTCP subflows (joins) and UDP senders, as peers;
   - IPv6 UDP binds when IPv6 is a module that is not loaded (it warns on
     stderr).
 
