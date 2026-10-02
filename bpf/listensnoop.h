@@ -20,7 +20,7 @@ struct listen_event_t {
     __u16 protocol; /* IPPROTO_* of the socket */
     __u16 port;     /* host byte order */
     __u8 kind;      /* LISTEN_KIND_* */
-    __u8 pad;
+    __u8 ephemeral; /* 1 if the kernel chose the port, not the caller */
     __u8 addr[16];  /* IPv4 in the first 4 bytes, else IPv6 */
     char comm[LISTEN_COMM_LEN];
 };

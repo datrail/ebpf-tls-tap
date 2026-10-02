@@ -7,6 +7,7 @@
 #include <argp.h>
 #include <arpa/inet.h>
 #include <bpf/bpf.h>
+#include <bpf/btf.h>
 #include <bpf/libbpf.h>
 #include <errno.h>
 #include <signal.h>
@@ -189,8 +190,9 @@ static int handle_event(void *ctx, void *data, size_t data_size)
 		printf(",\"protocol\":\"%s\"", proto);
 	else
 		printf(",\"protocol\":\"%u\"", e->protocol);
-	printf(",\"family\":\"%s\",\"addr\":\"%s\",\"port\":%u}\n",
-	       af == AF_INET6 ? "ipv6" : "ipv4", addr, e->port);
+	printf(",\"family\":\"%s\",\"addr\":\"%s\",\"port\":%u,\"ephemeral\":%s}\n",
+	       af == AF_INET6 ? "ipv6" : "ipv4", addr, e->port,
+	       e->ephemeral ? "true" : "false");
 	fflush(stdout);
 	return 0;
 }
@@ -235,6 +237,12 @@ static int report_drops(struct listensnoop_bpf *obj, __u64 *reported)
 		*reported = total;
 	}
 	return 0;
+}
+
+/* What an fexit program needs: the function in the kernel's BTF. */
+static bool vmlinux_has_func(const struct btf *vmlinux, const char *name)
+{
+	return vmlinux && btf__find_by_name_kind(vmlinux, name, BTF_KIND_FUNC) >= 0;
 }
 
 /* inet6_bind lives in the ipv6 module when IPv6 is not built in. */
@@ -283,11 +291,28 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 	obj->rodata->pidns_ino = ns.st_ino;
-	if (!kernel_has_symbol("inet6_bind")) {
+	/* One bind hook per family, never both: inet_bind calls inet_bind_sk,
+	 * so attaching both would report every bind twice. From 6.6, MPTCP's
+	 * binds reach only the _sk form; before, there is no _sk form and they
+	 * go through inet_bind like the rest. */
+	struct btf *vmlinux = btf__load_vmlinux_btf();
+	bool v4_sk = vmlinux_has_func(vmlinux, "inet_bind_sk");
+	/* An ipv6 module's functions are in its own BTF, which libbpf attaches
+	 * to when the module is loaded; kallsyms says whether it is. */
+	bool v6_sk = vmlinux_has_func(vmlinux, "inet6_bind_sk") ||
+		     kernel_has_symbol("inet6_bind_sk");
+	bool v6 = v6_sk || vmlinux_has_func(vmlinux, "inet6_bind") ||
+		  kernel_has_symbol("inet6_bind"); /* or the ipv6 module's BTF */
+
+	btf__free(vmlinux);
+
+	bpf_program__set_autoload(obj->progs.inet_bind_sk_exit, v4_sk);
+	bpf_program__set_autoload(obj->progs.inet_bind_exit, !v4_sk);
+	bpf_program__set_autoload(obj->progs.inet6_bind_sk_exit, v6_sk);
+	bpf_program__set_autoload(obj->progs.inet6_bind_exit, v6 && !v6_sk);
+	if (!v6)
 		fprintf(stderr, "warning: inet6_bind not found (IPv6 not loaded); "
 			"IPv6 UDP binds will not be reported\n");
-		bpf_program__set_autoload(obj->progs.inet6_bind_exit, false);
-	}
 
 	err = listensnoop_bpf__load(obj);
 	if (err) {

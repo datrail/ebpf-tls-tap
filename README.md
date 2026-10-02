@@ -32,7 +32,7 @@ sudo ./bpf/listensnoop            # or -p <pid> / -u <uid>
 ```
 
 ```json
-{"timestamp_ns":76326320956582,"kind":"listen","pid":4211,"tid":4211,"host_pid":2957315,"uid":1000,"comm":"python3","protocol":"tcp","family":"ipv4","addr":"127.0.0.1","port":38135}
+{"timestamp_ns":76326320956582,"kind":"listen","pid":4211,"tid":4211,"host_pid":2957315,"uid":1000,"comm":"python3","protocol":"tcp","family":"ipv4","addr":"127.0.0.1","port":38135,"ephemeral":true}
 ```
 
 One JSON object per line, one line per socket:
@@ -62,6 +62,13 @@ One JSON object per line, one line per socket:
   noisy, but it is not silent.
 - Address and port are read after the kernel assigned them, so a bind to port
   0, or a `listen()` with no `bind()`, reports the port actually chosen.
+- `ephemeral` is true when the kernel chose the socket's current port: its
+  latest bind asked for port 0, or it was unbound when `listen()` started, or
+  it was an autobind. A socket that releases a chosen port and then binds
+  one it asks for reads `false`. Such a port
+  differs on every run. A port the caller asked for is the service's
+  identity, whatever range it falls in, so compare listeners on
+  `ephemeral` rather than guessing from the number.
 - Failed calls produce nothing.
 - `pid`, `tid` and `-p` use the numbering of `listensnoop`'s own PID namespace.
   On the host, a containerised agent gets its host PID. Inside a container you

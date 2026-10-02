@@ -105,6 +105,96 @@ else:
     keep.append(p)
     expected.append(("bind", "icmp", "ipv4", "127.0.0.1", p.getsockname()[1]))
 
+# Every port above was the kernel's choice. These two are asked for, and
+# inside the ephemeral range (the probe's port came from it), which is where
+# a guess from the number alone would call them ephemeral.
+expected = [tuple(e) + (True,) for e in expected]
+def asked_for_port():
+    probe = socket.socket()          # TCP bind without listen: no event
+    probe.bind(("127.0.0.1", 0))
+    chosen = probe.getsockname()[1]
+    probe.close()
+    return chosen
+def bind_asked(s):
+    for _ in range(20):              # another process may take the port first
+        try:
+            s.bind(("127.0.0.1", asked_for_port()))
+            return
+        except OSError:
+            pass
+    raise SystemExit("no free port to ask for")
+t = socket.socket()
+bind_asked(t)
+t.listen()
+keep.append(t)
+expected.append(("listen", "tcp", "ipv4", "127.0.0.1", t.getsockname()[1], False))
+d = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+bind_asked(d)
+keep.append(d)
+expected.append(("bind", "udp", "ipv4", "127.0.0.1", d.getsockname()[1], False))
+
+# A socket can release a port the kernel chose (connect(AF_UNSPEC)
+# disconnects and unhashes it) and then bind one it asks for: that one is
+# not ephemeral, whatever happened to the socket before.
+import ctypes
+libc = ctypes.CDLL(None, use_errno=True)
+def disconnect(s):
+    unspec = (ctypes.c_ubyte * 16)()  # sa_family 0: AF_UNSPEC
+    if libc.connect(s.fileno(), unspec, 16) != 0:
+        raise SystemExit(f"connect(AF_UNSPEC): errno {ctypes.get_errno()}")
+r1 = socket.socket()
+r1.bind(("127.0.0.1", 0))            # kernel-chosen, no event (no listen)
+r1.connect(t.getsockname())
+disconnect(r1)
+bind_asked(r1)
+r1.listen()
+keep.append(r1)
+expected.append(("listen", "tcp", "ipv4", "127.0.0.1", r1.getsockname()[1], False))
+r2 = socket.socket()
+r2.listen()                          # kernel-chosen listener: one event
+expected.append(("listen", "tcp", "ipv4", "0.0.0.0", r2.getsockname()[1], True))
+disconnect(r2)
+bind_asked(r2)
+r2.listen()
+keep.append(r2)
+expected.append(("listen", "tcp", "ipv4", "127.0.0.1", r2.getsockname()[1], False))
+
+# MPTCP binds its subflow without going through inet_bind; the same reuse
+# must read the same way. Its listeners report the subflow's protocol, tcp.
+try:
+    m = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 262)  # IPPROTO_MPTCP
+except OSError:
+    have_mptcp = False
+else:
+    have_mptcp = True
+    m.listen()
+    expected.append(("listen", "tcp", "ipv4", "0.0.0.0", m.getsockname()[1], True))
+    disconnect(m)
+    bind_asked(m)
+    m.listen()
+    keep.append(m)
+    expected.append(("listen", "tcp", "ipv4", "127.0.0.1", m.getsockname()[1], False))
+    m0 = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 262)
+    m0.bind(("127.0.0.1", 0))
+    m0.listen()
+    keep.append(m0)
+    expected.append(("listen", "tcp", "ipv4", "127.0.0.1", m0.getsockname()[1], True))
+    if have_v6:                      # inet6_bind_sk, the other family's hook
+        m6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 262)
+        m6.bind(("::1", 0))
+        m6.listen()
+        keep.append(m6)
+        expected.append(("listen", "tcp", "ipv6", "::1", m6.getsockname()[1], True))
+        m6a = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 262)
+        m6a.bind(("::1", 0))
+        chosen = m6a.getsockname()[1]
+        m6a.close()
+        m6b = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 262)
+        m6b.bind(("::1", chosen))      # asked for, though another socket's choice
+        m6b.listen()
+        keep.append(m6b)
+        expected.append(("listen", "tcp", "ipv6", "::1", chosen, False))
+
 # None of these accepts inbound traffic, so none may produce an event.
 try:
     r = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
@@ -134,7 +224,7 @@ second.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 second.bind(first.getsockname())
 first.listen()
 keep += [first, second]
-expected.append(("listen", "tcp", "ipv4", "127.0.0.1", first.getsockname()[1]))
+expected.append(("listen", "tcp", "ipv4", "127.0.0.1", first.getsockname()[1], True))
 try:
     second.listen()                 # EADDRINUSE: a failed listen
     raise SystemExit("second listen unexpectedly succeeded")
@@ -142,7 +232,7 @@ except OSError:
     pass
 
 print(json.dumps({"expected": expected, "have_v6": have_v6,
-                  "have_ping": have_ping}), flush=True)
+                  "have_ping": have_ping, "have_mptcp": have_mptcp}), flush=True)
 """
 
 # Run under `unshare --pid --fork`: listens, reports its port and the PID its
@@ -225,7 +315,7 @@ def stop_snoop(proc):
 
 
 def key(e):
-    return (e["kind"], e["protocol"], e["family"], e["addr"], e["port"])
+    return (e["kind"], e["protocol"], e["family"], e["addr"], e["port"], e["ephemeral"])
 
 
 def main():
@@ -273,6 +363,8 @@ def main():
         print("note: no IPv6 on this host; IPv6 cases skipped")
     if not result["have_ping"]:
         print("note: ping sockets not allowed here; ICMP case skipped")
+    if not result["have_mptcp"]:
+        print("note: MPTCP not available here; MPTCP case skipped")
 
     all_events = stop_snoop(everything)
     filtered_events = stop_snoop(filtered)
