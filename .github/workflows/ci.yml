@@ -107,5 +107,9 @@ jobs:
       # contending on bind(); 64 threads on two CPUs, where skipped calls must
       # count as "lost"; and a stalled reader whose gap must surface as "lost".
       # python3 and unshare come with the runner image, cc with the toolchain.
+      # The runner disallows unprivileged ping sockets, which would skip the
+      # ICMP case; allow them for the run so it is exercised.
       - name: listensnoop reports exactly the listening sockets
-        run: sudo python3 tests/listensnoop_test.py bpf/listensnoop
+        run: |
+          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+          sudo python3 tests/listensnoop_test.py bpf/listensnoop
