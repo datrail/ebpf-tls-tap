@@ -3,7 +3,7 @@
 .PHONY: build build-bpf clean install
 
 build-bpf:
-	$(MAKE) -C bpf sslsniff
+	$(MAKE) -C bpf
 
 build: build-bpf
 

@@ -5,7 +5,7 @@ This product is part of the DatRail open-source agent-security toolchain
 (https://github.com/datrail).
 
 DatRail-owned userspace source, build glue, and documentation are distributed
-under Apache-2.0. The DatRail-owned kernel eBPF program is GPL-2.0-only. See
+under Apache-2.0. The DatRail-owned kernel eBPF programs (bpf/*.bpf.c) are GPL-2.0-only. See
 LICENSE and LICENSES/ for the ratified boundary.
 
 --------------------------------------------------------------------------------
