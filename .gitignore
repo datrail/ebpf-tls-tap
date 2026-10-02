@@ -1,4 +1,5 @@
 bpf/.output/
 bpf/sslsniff
+bpf/listensnoop
 *.o
 *.skel.h

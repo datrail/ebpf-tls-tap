@@ -3,6 +3,10 @@
 This repository builds `sslsniff`, which attaches uprobes to a process's TLS
 library and reads **plaintext before it is encrypted**. It runs privileged, and
 part of it runs **in the kernel**.
+It also builds `listensnoop`, which attaches fentry/fexit programs to the
+kernel's listen, bind and first-send socket paths and reports socket addresses
+and process names, no payload. Both load
+privileged kernel programs, so everything below applies to both.
 
 Two consequences worth being blunt about: a bug here can be a host-level
 compromise rather than an application one, and the data it handles is the
@@ -50,8 +54,9 @@ fact that capture requires privilege, which is inherent to what this does.
 
 ## A licensing note, relevant to contributors
 
-`bpf/sslsniff.bpf.c` declares `char LICENSE[] SEC("license") = "GPL"` — a
-statement to the kernel verifier and what permits the program to call GPL-only
-helpers. Preserve its GPL-2.0-only classification; DatRail's userspace source,
+`bpf/sslsniff.bpf.c` and `bpf/listensnoop.bpf.c` declare
+`char LICENSE[] SEC("license") = "GPL"` — a statement to the kernel verifier
+and what permits the programs to call GPL-only helpers. Preserve their
+GPL-2.0-only classification; DatRail's userspace source,
 build glue, and documentation are Apache-2.0, while vendored trees retain their
 upstream licenses.

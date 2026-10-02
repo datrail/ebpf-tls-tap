@@ -65,13 +65,15 @@ jobs:
       # was built and prove it is an executable.
       - name: Verify the artifact
         run: |
-          test -x bpf/sslsniff || { echo "bpf/sslsniff was not produced" >&2; exit 1; }
-          ls -la bpf/sslsniff
-          # The compiled BPF object must exist and be a BPF ELF, not an empty file.
-          test -s bpf/.output/sslsniff.bpf.o
-          readelf -h bpf/.output/sslsniff.bpf.o | grep -q 'Machine:.*BPF' \
-            || { echo "sslsniff.bpf.o is not a BPF object" >&2; exit 1; }
-          echo "ok: BPF object and loader both built"
+          for app in sslsniff listensnoop; do
+            test -x "bpf/$app" || { echo "bpf/$app was not produced" >&2; exit 1; }
+            ls -la "bpf/$app"
+            # The compiled BPF object must exist and be a BPF ELF, not an empty file.
+            test -s "bpf/.output/$app.bpf.o"
+            readelf -h "bpf/.output/$app.bpf.o" | grep -q 'Machine:.*BPF' \
+              || { echo "$app.bpf.o is not a BPF object" >&2; exit 1; }
+          done
+          echo "ok: BPF objects and loaders built"
 
       # An eBPF program that compiles but cannot load is the common failure —
       # a CO-RE relocation the runner kernel rejects, a helper the verifier
@@ -97,3 +99,13 @@ jobs:
             0|124) echo "ok: probe loaded and attached (exit $rc)" ;;
             *) echo "probe failed to load (exit $rc)" >&2; exit 1 ;;
           esac
+
+      # listensnoop is checked end to end, not just loaded (DR-124). Real
+      # TCP/UDP, IPv4/IPv6 listeners plus clients and failed calls that must
+      # stay silent; exactly one event per listener with the kernel-assigned
+      # port; -p; ICMP ping sockets; a nested PID namespace; 400 native threads
+      # contending on bind(); 64 threads on two CPUs, where skipped calls must
+      # count as "lost"; and a stalled reader whose gap must surface as "lost".
+      # python3 and unshare come with the runner image, cc with the toolchain.
+      - name: listensnoop reports exactly the listening sockets
+        run: sudo python3 tests/listensnoop_test.py bpf/listensnoop

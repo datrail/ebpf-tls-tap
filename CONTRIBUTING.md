@@ -11,8 +11,8 @@ Open an issue first for anything beyond an obvious fix. Kernel-side changes dese
 **Kernel code is different.** Anything the verifier accepts can still crash or
 leak on a kernel you did not test. State which kernels you ran it on.
 
-**Preserve the licence boundary.** `bpf/sslsniff.bpf.c` is GPL-2.0-only and
-declares `SEC("license") = "GPL"` to the verifier. DatRail userspace source,
+**Preserve the licence boundary.** The kernel programs `bpf/*.bpf.c` are
+GPL-2.0-only and declare `SEC("license") = "GPL"` to the verifier. DatRail userspace source,
 build glue, and documentation are Apache-2.0. Vendored submodules retain their
 upstream licences. A file moving across that boundary needs explicit review.
 
