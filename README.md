@@ -63,8 +63,8 @@ One JSON object per line, one line per socket or new peer:
   client of a dual-stack IPv6 listener written as plain IPv4. The kernel
   remembers which (process, listener, peer) it has reported, so a busy server
   costs one event per new peer, not one per connection. A process is its
-  host PID, start time and `comm`, so a reused PID or an `exec()` starts
-  afresh. That memory is a 16,384-entry LRU: past that, an old peer can be
+  host PID, start time and exec count, so a reused PID or an `exec()` starts
+  afresh, while threads with their own names count as one process. That memory is a 16,384-entry LRU: past that, an old peer can be
   reported again. A connection nobody accepts is not reported, and neither
   are UDP senders (UDP has no accept) or MPTCP joins (a later subflow,
   possibly from another address, added to an accepted connection without

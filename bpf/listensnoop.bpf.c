@@ -104,14 +104,16 @@ struct {
  * address), so a busy server costs an event per new peer, not one per
  * connection. LRU, so it can't fill: an evicted peer is only reported again
  * when it next connects, which a consumer that keeps a set absorbs. The
- * process is its host PID plus its start time and comm, so a reused PID or
- * an exec() into another program is a new process, whose peers are new. */
+ * process is its host PID plus its start time and exec count, so a reused
+ * PID or an exec() into another program is a new process, whose peers are
+ * new. Not comm: that is per thread and settable, and a server whose
+ * worker threads have names would report each peer once per worker. */
 struct peer_key {
-    __u64 start_time; /* the thread group leader's, in ns since boot */
+    __u64 start_time; /* the thread group leader's, monotonic ns */
+    __u64 exec_id;    /* its self_exec_id: one more on every exec() */
     __u32 tgid;       /* host PID: stable whatever namespace listensnoop is in */
     __u16 family;
     __u16 port;
-    char comm[LISTEN_COMM_LEN];
     __u8 addr[16];    /* the listener's: two on one port are two listeners */
     __u8 peer[16];
 };
@@ -379,6 +381,7 @@ int BPF_PROG(accept_exit, struct sock *sk)
 {
     struct listen_event_t *e;
     struct peer_key key = {};
+    struct task_struct *leader;
     struct sock *child;
     u32 pid, tid, uid;
     u16 family;
@@ -391,12 +394,12 @@ int BPF_PROG(accept_exit, struct sock *sk)
     family = BPF_CORE_READ(sk, __sk_common.skc_family);
     if (!wanted(family, &pid, &tid, &uid))
         return 0;
-    key.start_time = BPF_CORE_READ((struct task_struct *)bpf_get_current_task(),
-                                   group_leader, start_time);
+    leader = BPF_CORE_READ((struct task_struct *)bpf_get_current_task(), group_leader);
+    key.start_time = BPF_CORE_READ(leader, start_time);
+    key.exec_id = BPF_CORE_READ(leader, self_exec_id);
     key.tgid = bpf_get_current_pid_tgid() >> 32;
     key.family = family;
     key.port = BPF_CORE_READ(sk, __sk_common.skc_num);
-    bpf_get_current_comm(&key.comm, sizeof(key.comm));
     if (family == AF_INET)
         BPF_CORE_READ_INTO((__be32 *)key.addr, sk, __sk_common.skc_rcv_saddr);
     else

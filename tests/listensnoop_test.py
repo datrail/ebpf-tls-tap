@@ -300,11 +300,17 @@ connect(b2)
 accept_all(b2, 1)
 expected.append(("127.0.0.3", b.getsockname()[1], "127.0.0.1"))
 
-# 32 connections from one peer accepted by 8 threads at once: still one.
+# 32 connections from one peer accepted by 8 threads at once, each thread
+# named differently (as server workers often are): still one.
+import ctypes
+libc = ctypes.CDLL(None, use_errno=True)
+def named_worker(n):
+    libc.prctl(15, f"worker-{n}".encode(), 0, 0, 0)  # PR_SET_NAME
+    accept_all(r, 4)
 r = listener(socket.AF_INET, "127.0.0.1")
 for _ in range(32):
     connect(r)
-workers = [threading.Thread(target=accept_all, args=(r, 4)) for _ in range(8)]
+workers = [threading.Thread(target=named_worker, args=(n,)) for n in range(8)]
 [w.start() for w in workers]
 [w.join() for w in workers]
 expected.append(("127.0.0.1", r.getsockname()[1], "127.0.0.1"))
