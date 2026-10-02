@@ -4,7 +4,7 @@ eBPF TLS Tap is DatRail's low-level Linux TLS observation component. It builds
 `bpf/sslsniff`, which attaches uprobes to OpenSSL, GnuTLS, and NSS and prints
 decrypted TLS traffic for inspection and downstream parsing, and
 `bpf/listensnoop`, which reports every TCP, UDP or ICMP-echo socket that
-starts accepting inbound traffic.
+starts accepting inbound traffic, and who connects to it.
 
 ## Quick start
 
@@ -25,7 +25,8 @@ payload bytes. Run `sudo ./bpf/sslsniff --help` for all options.
 
 An agent that opens a local port is offering a service nobody declared — a
 covert channel no TLS call ever reveals. `listensnoop` reports each TCP, UDP
-or ICMP-echo socket that starts accepting inbound traffic, as it appears:
+or ICMP-echo socket that starts accepting inbound traffic, as it appears, and
+each new remote address a TCP listener accepts a connection from:
 
 ```bash
 sudo ./bpf/listensnoop            # or -p <pid> / -u <uid>
@@ -35,7 +36,11 @@ sudo ./bpf/listensnoop            # or -p <pid> / -u <uid>
 {"timestamp_ns":76326320956582,"kind":"listen","pid":4211,"tid":4211,"host_pid":2957315,"uid":1000,"comm":"python3","protocol":"tcp","family":"ipv4","addr":"127.0.0.1","port":38135,"ephemeral":true}
 ```
 
-One JSON object per line, one line per socket:
+```json
+{"timestamp_ns":97926295426156,"kind":"peer","pid":4211,"tid":4211,"host_pid":2957315,"uid":1000,"comm":"python3","protocol":"tcp","family":"ipv4","addr":"127.0.0.1","port":38135,"ephemeral":true,"peer":"127.0.0.5"}
+```
+
+One JSON object per line, one line per socket or new peer:
 
 - `"kind":"listen"`: a TCP socket entered LISTEN (`inet_csk_listen_start`).
   A repeated `listen()` that only resizes the backlog is not reported again.
@@ -50,6 +55,22 @@ One JSON object per line, one line per socket:
   it (`inet_send_prepare`). Unconnected, it now receives from anyone. This also
   covers a bind made with `IP_BIND_ADDRESS_NO_PORT`, which gets its port here.
   A `connect()` is not reported, since a connected socket only hears its peer.
+- `"kind":"peer"`: a process accepted a TCP connection from a remote address
+  (`inet_csk_accept`, which every `accept()`, `accept4()` and io_uring accept
+  reaches) for the first time on that listener. `addr`, `port`,
+  `family` and `ephemeral` are the listener's, so a peer joins to the
+  `listen` event it belongs to; `peer` is the remote address, with an IPv4
+  client of a dual-stack IPv6 listener written as plain IPv4. The kernel
+  remembers which (process, listener, peer) it has reported, so a busy server
+  costs one event per new peer, not one per connection. A process is its
+  host PID, start time and exec count, so a reused PID or an `exec()` starts
+  afresh, while threads with their own names count as one process. That memory is a 16,384-entry LRU: past that, an old peer can be
+  reported again. A connection nobody accepts is not reported, and neither
+  are UDP senders (UDP has no accept) or MPTCP joins (a later subflow,
+  possibly from another address, added to an accepted connection without
+  another accept). Behind NAT or a proxy, `peer`
+  is the last hop (for a Docker published port with the userland proxy, the
+  bridge gateway), not the original client.
 - `"kind":"lost","count":N`: up to N events were missed. The count includes
   events the ring buffer had no room for, and calls the kernel skipped
   because the same program was already running on that CPU (its
@@ -78,7 +99,9 @@ One JSON object per line, one line per socket:
 - `-n` (`--own-namespace`) leaves processes listensnoop's PID namespace
   cannot see out, in the kernel, instead of reporting them with `pid` 0. Run
   in an agent's namespace, it records that namespace and any nested in it.
-- Each attach prints `{"kind":"start","time":...,"every":N}`. `-H SECONDS`
+- Each attach prints `{"kind":"start","time":...,"every":N,"peers":true}`;
+  `peers` says this version reports `peer` events, so a consumer can tell
+  "nobody connected" from a probe too old to report it. `-H SECONDS`
   (`--heartbeat`) adds an `alive` line of the same shape about every N
   seconds, scheduled on the monotonic clock and stamped in wall-clock UTC.
   A consumer can then tell a quiet probe from a stopped one, and see a
@@ -91,6 +114,7 @@ One JSON object per line, one line per socket:
     for those);
   - SCTP;
   - raw and packet sockets;
+  - additional MPTCP subflows (joins) and UDP senders, as peers;
   - IPv6 UDP binds when IPv6 is a module that is not loaded (it warns on
     stderr).
 
@@ -101,6 +125,8 @@ separate from sslsniff's.
 
 Measured on a 7.3 kernel:
 - about 0.9 µs added per `listen()`/`bind()` call;
+- about 0.3 µs added per accepted TCP connection (11.2 µs against 10.9 for a
+  loopback connect/accept/close);
 - about 28 ns (3%) added per `sendmsg()` on any inet socket, because the
   autobind hook sits on the send path;
 - 80,000 events in a tight loop with none lost;
@@ -108,7 +134,9 @@ Measured on a 7.3 kernel:
 
 `tests/listensnoop_test.py` runs in CI and checks the exact event set against
 real sockets: TCP, UDP and ICMP, IPv4 and IPv6, a nested PID namespace,
-native-thread contention, CPU oversubscription and a stalled reader.
+native-thread contention, CPU oversubscription and a stalled reader, plus
+accepted peers (repeats, eight threads accepting one peer at once, a
+dual-stack listener, an unaccepted connection).
 
 ## Architecture
 
@@ -118,7 +146,7 @@ flowchart LR
   bpf --> events[Perf-event buffer]
   events --> sslsniff[Userspace sslsniff]
   sslsniff -->|Multiline plaintext or hex| output[Terminal or parser]
-  process -->|listen / bind / first sendto| kfn[eBPF fentry/fexit on kernel socket functions]
+  process -->|listen / bind / first sendto / accept| kfn[eBPF fentry/fexit on kernel socket functions]
   kfn --> ring[Ring buffer + drop counter]
   ring --> listensnoop[Userspace listensnoop]
   listensnoop -->|JSON lines| output
@@ -133,7 +161,8 @@ kernel type-header sources needed for reproducible builds.
 
 These programs require elevated BPF privileges. sslsniff exposes plaintext
 that TLS normally protects; listensnoop reads no payload, only socket
-addresses, process names and IDs. Restrict capture to the intended process,
+addresses (including the addresses of clients that connect), process names
+and IDs. Restrict capture to the intended process,
 protect stdout and downstream logs, and never run either on a host or workload
 you are not authorized to observe. Read [SECURITY.md](SECURITY.md) and report vulnerabilities privately
 through GitHub Security Advisories.

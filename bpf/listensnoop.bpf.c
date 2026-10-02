@@ -24,6 +24,10 @@
 //   unconnected datagram socket bound that way receives from anyone, so it
 //   is a listener too. connect() autobinds through a different path and is
 //   not reported: a connected socket only hears its peer.
+// - inet_csk_accept(sk, ...) hands a TCP listener's next connection to the
+//   process serving it. The first time a given remote address is accepted on
+//   a given process's listener port, that peer is reported: who actually
+//   connects in, not just that a door is open.
 //
 // fentry/fexit, not kprobes: fexit sees the arguments and the return value
 // together, so there is no entry-to-return map that a burst of concurrent
@@ -95,6 +99,31 @@ struct {
     __type(key, int);
     __type(value, __u8);
 } kernel_chose SEC(".maps");
+
+/* Peers already reported: one event per (process, listener, remote
+ * address), so a busy server costs an event per new peer, not one per
+ * connection. LRU, so it can't fill: an evicted peer is only reported again
+ * when it next connects, which a consumer that keeps a set absorbs. The
+ * process is its host PID plus its start time and exec count, so a reused
+ * PID or an exec() into another program is a new process, whose peers are
+ * new. Not comm: that is per thread and settable, and a server whose
+ * worker threads have names would report each peer once per worker. */
+struct peer_key {
+    __u64 start_time; /* the thread group leader's, monotonic ns */
+    __u64 exec_id;    /* its self_exec_id: one more on every exec() */
+    __u32 tgid;       /* host PID: stable whatever namespace listensnoop is in */
+    __u16 family;
+    __u16 port;
+    __u8 addr[16];    /* the listener's: two on one port are two listeners */
+    __u8 peer[16];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct peer_key);
+    __type(value, __u8);
+} peers_seen SEC(".maps");
 
 const volatile pid_t targ_pid = 0;
 const volatile uid_t targ_uid = -1;
@@ -185,27 +214,23 @@ static __always_inline bool kernel_chose_port(struct sock *sk)
     return flag && *flag;
 }
 
-static __always_inline void emit(void *ctx, struct sock *sk, u8 kind, bool ephemeral)
+/* Whether the current process is one to report, with its IDs. */
+static __always_inline bool wanted(u16 family, u32 *pid, u32 *tid, u32 *uid)
 {
-    struct listen_event_t *e;
-    u32 pid, tid, uid = bpf_get_current_uid_gid();
-    u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
+    *uid = bpf_get_current_uid_gid();
+    ns_pid_tid(pid, tid);
+    if (own_ns_only && !*pid)
+        return false;
+    if (targ_pid && targ_pid != *pid)
+        return false;
+    if (targ_uid != (uid_t)-1 && targ_uid != *uid)
+        return false;
+    return family == AF_INET || family == AF_INET6;
+}
 
-    ns_pid_tid(&pid, &tid);
-    if (own_ns_only && !pid)
-        return;
-    if (targ_pid && targ_pid != pid)
-        return;
-    if (targ_uid != (uid_t)-1 && targ_uid != uid)
-        return;
-    if (family != AF_INET && family != AF_INET6)
-        return;
-
-    e = bpf_ringbuf_reserve(&listen_events, sizeof(*e), 0);
-    if (!e) {
-        count_drop();
-        return;
-    }
+static __always_inline void fill(struct listen_event_t *e, struct sock *sk, u8 kind,
+                                 bool ephemeral, u32 pid, u32 tid, u32 uid, u16 family)
+{
     __builtin_memset(e, 0, sizeof(*e));
     e->pid = pid;
     e->tid = tid;
@@ -222,6 +247,22 @@ static __always_inline void emit(void *ctx, struct sock *sk, u8 kind, bool ephem
     e->timestamp_ns = bpf_ktime_get_ns();
     e->host_pid = bpf_get_current_pid_tgid() >> 32;
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
+}
+
+static __always_inline void emit(void *ctx, struct sock *sk, u8 kind, bool ephemeral)
+{
+    struct listen_event_t *e;
+    u32 pid, tid, uid;
+    u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
+
+    if (!wanted(family, &pid, &tid, &uid))
+        return;
+    e = bpf_ringbuf_reserve(&listen_events, sizeof(*e), 0);
+    if (!e) {
+        count_drop();
+        return;
+    }
+    fill(e, sk, kind, ephemeral, pid, tid, uid, family);
     bpf_ringbuf_submit(e, 0);
 }
 
@@ -321,6 +362,70 @@ int BPF_PROG(send_prepare_exit, struct sock *sk)
     *slot = 0;
     if (succeeded(ctx) && BPF_CORE_READ(sk, __sk_common.skc_num))
         emit(ctx, sk, LISTEN_KIND_AUTOBIND, true);
+    return 0;
+}
+
+/* accept() and every other way of taking a connection off a TCP listener's
+ * queue (accept4, io_uring, MPTCP's first subflow) returns the new socket
+ * here, in the context of the process taking it: the one serving the peer.
+ * The handshake itself completes in softirq, with no process to attribute it
+ * to, so a connection nobody accepts is not reported, and neither is an
+ * MPTCP join: a later subflow, possibly from another address, that the
+ * kernel adds to an accepted connection without another accept. Address, port and
+ * family are the listener's, so a consumer can join the peer to the listener
+ * it reported; on a dual-stack IPv6 listener an IPv4 peer is IPv4-mapped. */
+#define EEXIST 17
+
+SEC("fexit/inet_csk_accept")
+int BPF_PROG(accept_exit, struct sock *sk)
+{
+    struct listen_event_t *e;
+    struct peer_key key = {};
+    struct task_struct *leader;
+    struct sock *child;
+    u32 pid, tid, uid;
+    u16 family;
+    u8 seen = 1;
+    u64 ret;
+
+    if (bpf_get_func_ret(ctx, &ret) || !ret)
+        return 0;
+    child = (struct sock *)ret;
+    family = BPF_CORE_READ(sk, __sk_common.skc_family);
+    if (!wanted(family, &pid, &tid, &uid))
+        return 0;
+    leader = BPF_CORE_READ((struct task_struct *)bpf_get_current_task(), group_leader);
+    key.start_time = BPF_CORE_READ(leader, start_time);
+    key.exec_id = BPF_CORE_READ(leader, self_exec_id);
+    key.tgid = bpf_get_current_pid_tgid() >> 32;
+    key.family = family;
+    key.port = BPF_CORE_READ(sk, __sk_common.skc_num);
+    if (family == AF_INET)
+        BPF_CORE_READ_INTO((__be32 *)key.addr, sk, __sk_common.skc_rcv_saddr);
+    else
+        BPF_CORE_READ_INTO((struct in6_addr *)key.addr, sk, __sk_common.skc_v6_rcv_saddr);
+    /* Into a field of the source's own type: BPF_CORE_READ_INTO copies
+     * sizeof(*dst), and 16 bytes from skc_daddr run on into the client's
+     * port, which would make every connection a new peer. */
+    if (family == AF_INET)
+        BPF_CORE_READ_INTO((__be32 *)key.peer, child, __sk_common.skc_daddr);
+    else
+        BPF_CORE_READ_INTO((struct in6_addr *)key.peer, child, __sk_common.skc_v6_daddr);
+    /* NOEXIST makes the check and the insert one step: of two CPUs taking
+     * the same new peer at once, exactly one reports it. Any other failure
+     * reports anyway; a duplicate is harmless, a gap is not. */
+    if (bpf_map_update_elem(&peers_seen, &key, &seen, BPF_NOEXIST) == -EEXIST)
+        return 0;
+    e = bpf_ringbuf_reserve(&listen_events, sizeof(*e), 0);
+    if (!e) {
+        /* Forget it, so the next connection from this peer is reported. */
+        bpf_map_delete_elem(&peers_seen, &key);
+        count_drop();
+        return 0;
+    }
+    fill(e, sk, LISTEN_KIND_PEER, kernel_chose_port(sk), pid, tid, uid, family);
+    __builtin_memcpy(e->peer, key.peer, sizeof(e->peer));
+    bpf_ringbuf_submit(e, 0);
     return 0;
 }
 

@@ -26,6 +26,11 @@ it failed:
   carrying it, and a bind with IP_BIND_ADDRESS_NO_PORT has no port until its
   first sendto(): one event each, with the identifier or real port.
 
+Peers (DR-144): a server accepting connections must get one "peer" event per
+remote address per listening port, however many times or how concurrently
+that address connects, with an IPv4 client of a dual-stack listener reported
+as IPv4, and nothing for a connection nobody accepts.
+
 Usage: sudo python3 tests/listensnoop_test.py [path/to/listensnoop]
 """
 import calendar
@@ -247,6 +252,88 @@ print(s.getsockname()[1], os.getpid(), flush=True)
 sys.stdin.readline()
 """
 
+# Accepts connections from clients it makes itself and prints the peer
+# events it expects: (listener addr, port, peer). The clients are threads of
+# this process, but only the server side accepts, so only it is reported.
+PEERS = r"""
+import json, socket, sys, threading
+sys.stdin.readline()
+keep, expected = [], []
+
+def listener(family, addr):
+    s = socket.socket(family, socket.SOCK_STREAM)
+    s.bind((addr, 0))
+    s.listen(128)
+    keep.append(s)
+    return s
+
+def connect(server, src=None, dst=None):
+    family = server.family if dst is None or ":" in dst else socket.AF_INET
+    c = socket.socket(family, socket.SOCK_STREAM)
+    if src:
+        c.bind((src, 0))
+    c.connect((dst or server.getsockname()[0], server.getsockname()[1]))
+    keep.append(c)
+
+def accept_all(server, n):
+    for _ in range(n):
+        a, _ = server.accept()
+        keep.append(a)
+
+a = listener(socket.AF_INET, "127.0.0.1")
+for _ in range(3):                   # the same peer three times: one event
+    connect(a)
+connect(a, src="127.0.0.2")          # another peer: another event
+accept_all(a, 4)
+expected += [("127.0.0.1", a.getsockname()[1], "127.0.0.1"),
+             ("127.0.0.1", a.getsockname()[1], "127.0.0.2")]
+
+b = listener(socket.AF_INET, "127.0.0.1")
+connect(b)                           # the same peer on another port: an event
+accept_all(b, 1)
+expected.append(("127.0.0.1", b.getsockname()[1], "127.0.0.1"))
+b2 = socket.socket()                 # the same port on another address: a
+b2.bind(("127.0.0.3", b.getsockname()[1]))  # different listener, so an event
+b2.listen()
+keep.append(b2)
+connect(b2)
+accept_all(b2, 1)
+expected.append(("127.0.0.3", b.getsockname()[1], "127.0.0.1"))
+
+# 32 connections from one peer accepted by 8 threads at once, each thread
+# named differently (as server workers often are): still one.
+import ctypes
+libc = ctypes.CDLL(None, use_errno=True)
+def named_worker(n):
+    libc.prctl(15, f"worker-{n}".encode(), 0, 0, 0)  # PR_SET_NAME
+    accept_all(r, 4)
+r = listener(socket.AF_INET, "127.0.0.1")
+for _ in range(32):
+    connect(r)
+workers = [threading.Thread(target=named_worker, args=(n,)) for n in range(8)]
+[w.start() for w in workers]
+[w.join() for w in workers]
+expected.append(("127.0.0.1", r.getsockname()[1], "127.0.0.1"))
+
+# Queued but never accepted: the server never took it, so no event.
+q = listener(socket.AF_INET, "127.0.0.1")
+connect(q)
+
+have_v6 = socket.has_ipv6
+try:
+    d = listener(socket.AF_INET6, "::")
+except OSError:
+    have_v6 = False
+if have_v6:
+    connect(d, dst="::1")
+    connect(d, dst="127.0.0.1")      # IPv4 on a dual-stack listener
+    accept_all(d, 2)
+    expected += [("::", d.getsockname()[1], "::1"),
+                 ("::", d.getsockname()[1], "127.0.0.1")]
+
+print(json.dumps({"expected": expected, "have_v6": have_v6}), flush=True)
+"""
+
 DECOY = r"""
 import socket, sys
 sys.stdin.readline()
@@ -414,6 +501,35 @@ def main():
     check(sorted(key(e) for e in filtered_events) == expected,
           "-p still reports every event of that PID")
 
+    # Peers (DR-144): an unfiltered run and one filtered to the server.
+    everything = start_snoop()
+    server = subprocess.Popen([sys.executable, "-c", PEERS],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    filtered = start_snoop("-p", str(server.pid))
+    server_out, _ = server.communicate("go\n", timeout=60)
+    check(server.returncode == 0, "peer server accepted every connection")
+    peers = json.loads(server_out)
+    if not peers["have_v6"]:
+        print("note: no IPv6 on this host; dual-stack peer cases skipped")
+    want = sorted(tuple(e) for e in peers["expected"])
+    peer_events = [e for e in stop_snoop(everything) if e["kind"] == "peer"]
+    filtered_all = [e for e in stop_snoop(filtered) if e["kind"] != "lost"]
+    filtered_peers = [e for e in filtered_all if e["kind"] == "peer"]
+    got = sorted((e["addr"], e["port"], e["peer"]) for e in peer_events if e["pid"] == server.pid)
+    check(got == want,
+          f"one peer event per remote address per listening port, none for an "
+          f"unaccepted connection\n      missing    {sorted(set(want) - set(got))}"
+          f"\n      unexpected {sorted(set(got) - set(want))}\n      all {got}")
+    # Every listener's port was the kernel's choice but 127.0.0.3's, which
+    # asked for the port another listener had been given.
+    check(all(e["protocol"] == "tcp" and e["ephemeral"] is (e["addr"] != "127.0.0.3")
+              and e["family"] == ("ipv6" if e["addr"] == "::" else "ipv4")
+              for e in peer_events if e["pid"] == server.pid),
+          "peer events carry the listener's protocol, family and ephemeral flag")
+    check(sorted((e["addr"], e["port"], e["peer"]) for e in filtered_peers) == want
+          and all(e["pid"] == server.pid for e in filtered_all),
+          "-p reports that server's peers and nothing else")
+
     # -n and -H (DR-143), from inside a new PID namespace: this test's own
     # process is outside it, so its listener is pid 0 to an unfiltered run
     # and absent with -n; -H prints wall-clock alive lines meanwhile.
@@ -440,8 +556,9 @@ def main():
         check(len(alive) >= 2 and all(
             e["every"] == 1 and abs(utc(e["time"]) - started) < 60 for e in alive),
               f"-H 1 prints wall-clock alive lines ({len(alive)} in ~3.5s)")
-        check(len(starts) == 1 and starts[0]["every"] == 1 and abs(utc(starts[0]["time"]) - started) < 60,
-              "one start record at attach")
+        check(len(starts) == 1 and starts[0]["every"] == 1 and abs(utc(starts[0]["time"]) - started) < 60
+              and starts[0].get("peers") is True,
+              "one start record at attach, saying it reports peers")
         check(not any(e["kind"] == "alive" for e in unfiltered_events)
               and [e["every"] for e in unfiltered_events if e["kind"] == "start"] == [0],
               "and without -H, a start record but no alive lines")

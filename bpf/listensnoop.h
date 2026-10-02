@@ -9,6 +9,7 @@
 #define LISTEN_KIND_LISTEN 1 /* a stream socket moved to LISTEN */
 #define LISTEN_KIND_BIND 2   /* a datagram socket bound a local port */
 #define LISTEN_KIND_AUTOBIND 3 /* an unbound datagram socket's first sendto() */
+#define LISTEN_KIND_PEER 4 /* a new remote address connected to a TCP listener */
 
 struct listen_event_t {
     __u64 timestamp_ns;
@@ -22,6 +23,7 @@ struct listen_event_t {
     __u8 kind;      /* LISTEN_KIND_* */
     __u8 ephemeral; /* 1 if the kernel chose the port, not the caller */
     __u8 addr[16];  /* IPv4 in the first 4 bytes, else IPv6 */
+    __u8 peer[16];  /* LISTEN_KIND_PEER only: the remote address, same layout */
     char comm[LISTEN_COMM_LEN];
 };
 
