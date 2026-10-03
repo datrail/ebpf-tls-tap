@@ -26,10 +26,10 @@
 //   process never named. Any other layer open is reported, marked "layer":
 //   an unprivileged process can mount its own overlay in a user namespace,
 //   over any directory it can read, and choose the path it reads through;
-//   the layer event names the file actually read. A layer open is one on a
-//   layer's private mount, which belongs to no mount namespace (6.8 and
-//   later), or one whose file's inode is not its path's (before 6.8, the
-//   file beneath carries the overlay's path).
+//   the layer event names the file actually read. A layer open is one whose
+//   path is on a layer's private mount, which belongs to no mount namespace
+//   (6.8 and later), or one whose file's inode is not its path's (before
+//   6.8, the file beneath carries the overlay's path).
 // - Only regular files: devices, FIFOs and directories carry no file content
 //   to read or write, and neither do pidfds and namespace files, which are
 //   regular files on kernel-internal filesystems.
@@ -197,7 +197,10 @@ int BPF_PROG(file_open_exit, struct file *file)
     key.mnt = (u64)BPF_CORE_READ(file, f_path.mnt);
     key.dentry = (u64)BPF_CORE_READ(file, f_path.dentry);
     key.ino = BPF_CORE_READ(inode, i_ino);
-    key.access = access;
+    /* Before 6.8 a layer open has the overlay's mount and dentry, and
+     * overlayfs gives its inode the real one's number: only this keeps it
+     * from reading as the process's own open, already reported. */
+    key.access = access | (layer << 8);
     /* NOEXIST makes the check and the insert one step, as for listensnoop's
      * peers: of two threads opening the same new file at once, exactly one
      * reports it. Any other failure reports anyway. */
