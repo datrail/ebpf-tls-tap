@@ -15,10 +15,18 @@
 //   thousand times costs one event, and one that later opens it to write is
 //   reported again. Like listensnoop's peers, the set is an LRU, so it can't
 //   fill; an evicted file is only reported again on its next open.
-// - overlayfs (every container's root) opens the file in the layer beneath
-//   on the opener's behalf, inside the open of the file the process asked
-//   for. That inner open goes through security_file_open too. It is skipped:
-//   it is the same open, under a path the process never named.
+// - overlayfs (every container's root) opens files in its layers on the
+//   opener's behalf: the file beneath the one the process asked for, and the
+//   lower file when a write copies it up. Those opens go through
+//   security_file_open too, on a private mount of the layer that belongs to
+//   no mount namespace (MNT_NS_INTERNAL). For an overlay mounted from the
+//   initial user namespace, which is how a container runtime mounts a
+//   container's root, they are skipped while the process's own open of the
+//   overlay file is in progress: they are that open, under a path the
+//   process never named. Any other open on an internal mount is reported,
+//   marked "layer". An unprivileged process can mount its own overlay in a
+//   user namespace, over any directory it can read, and choose the path it
+//   reads through; the layer event names the file actually read.
 // - Only regular files: devices, FIFOs and directories carry no file content
 //   to read or write.
 //
@@ -44,6 +52,9 @@
 #define FMODE_EXEC 0x20
 #define FMODE_EXEC_FLAG_OLD 040000000
 #define EEXIST 17
+#define EINVAL 22
+#define OVERLAYFS_SUPER_MAGIC 0x794c7630
+#define PROC_USER_INIT_INO 0xEFFFFFFDU /* the initial user namespace */
 
 /* A ring buffer, for the reason listensnoop's is: a loss is always counted,
  * in dropped, even when nothing follows it. Events are variable-length, so
@@ -70,15 +81,17 @@ struct {
     __type(value, struct file_event_t);
 } scratch SEC(".maps");
 
-/* How deep the current task is inside overlayfs's open of a lower file.
- * Task storage lives and dies with the task, so it has no capacity to
- * exhaust. */
+/* The overlay file the current task is opening, while it is being opened,
+ * if a container runtime (the initial user namespace) mounted the overlay;
+ * else 0. Set by every open on a mount in a namespace, so a value left by an
+ * open whose do_dentry_open exit was skipped lasts only until the task's
+ * next open. Task storage lives and dies with the task. */
 struct {
     __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
     __uint(map_flags, BPF_F_NO_PREALLOC);
     __type(key, int);
-    __type(value, __u32);
-} inner_open SEC(".maps");
+    __type(value, __u64);
+} overlay_open SEC(".maps");
 
 /* Files already reported. The process is its host PID plus its start time
  * and exec count, as in listensnoop's peers_seen, so a reused PID or an
@@ -120,62 +133,58 @@ static __always_inline void count_drop(void)
         __sync_fetch_and_add(drops, 1);
 }
 
-static __always_inline int inner_enter(void)
+/* A mount that belongs to no namespace: a layer of an overlay, or a
+ * kernel-internal mount. */
+static __always_inline bool internal_mount(struct vfsmount *vfs)
+{
+    struct mount *m = (void *)vfs - bpf_core_field_offset(struct mount, mnt);
+
+    return (long)BPF_CORE_READ(m, mnt_ns) == -EINVAL; /* MNT_NS_INTERNAL */
+}
+
+static __always_inline bool runtime_overlay(struct super_block *sb)
+{
+    return BPF_CORE_READ(sb, s_magic) == OVERLAYFS_SUPER_MAGIC &&
+           BPF_CORE_READ(sb, s_user_ns, ns.inum) == PROC_USER_INIT_INO;
+}
+
+/* Whether an open on an internal mount is overlayfs working for the
+ * task's open of a runtime overlay's file; on any other mount, note
+ * whether this open is one. */
+static __always_inline bool layer_open_to_skip(struct file *file, bool internal)
 {
     struct task_struct *task = bpf_get_current_task_btf();
-    __u32 *depth = bpf_task_storage_get(&inner_open, task, 0,
-                                        BPF_LOCAL_STORAGE_GET_F_CREATE);
+    __u64 *outer;
 
-    if (depth)
-        (*depth)++;
-    else
-        count_drop(); /* out of memory: the inner open will be reported */
+    if (internal) {
+        outer = bpf_task_storage_get(&overlay_open, task, 0, 0);
+        return outer && *outer;
+    }
+    if (runtime_overlay(BPF_CORE_READ(file, f_path.dentry, d_sb))) {
+        outer = bpf_task_storage_get(&overlay_open, task, 0,
+                                     BPF_LOCAL_STORAGE_GET_F_CREATE);
+        if (outer)
+            *outer = (__u64)file;
+        /* Out of memory: its layer opens are reported, marked as such. */
+    } else {
+        outer = bpf_task_storage_get(&overlay_open, task, 0, 0);
+        if (outer)
+            *outer = 0;
+    }
+    return false;
+}
+
+/* The overlay file's open is over: anything else on an internal mount is
+ * not part of it. */
+SEC("fexit/do_dentry_open")
+int BPF_PROG(dentry_open_exit, struct file *file)
+{
+    struct task_struct *task = bpf_get_current_task_btf();
+    __u64 *outer = bpf_task_storage_get(&overlay_open, task, 0, 0);
+
+    if (outer && *outer == (__u64)file)
+        *outer = 0;
     return 0;
-}
-
-static __always_inline int inner_exit(void)
-{
-    struct task_struct *task = bpf_get_current_task_btf();
-    __u32 *depth = bpf_task_storage_get(&inner_open, task, 0, 0);
-
-    if (depth && *depth)
-        (*depth)--;
-    return 0;
-}
-
-/* backing_file_open (6.6+) is overlayfs's, and FUSE passthrough's, open of
- * the file beneath; open_with_fake_path is the same before 6.6. The loader
- * attaches whichever pair this kernel has. */
-SEC("fentry/backing_file_open")
-int BPF_PROG(backing_open_enter)
-{
-    return inner_enter();
-}
-
-SEC("fexit/backing_file_open")
-int BPF_PROG(backing_open_exit)
-{
-    return inner_exit();
-}
-
-SEC("fentry/open_with_fake_path")
-int BPF_PROG(fake_path_open_enter)
-{
-    return inner_enter();
-}
-
-SEC("fexit/open_with_fake_path")
-int BPF_PROG(fake_path_open_exit)
-{
-    return inner_exit();
-}
-
-static __always_inline bool is_inner_open(void)
-{
-    struct task_struct *task = bpf_get_current_task_btf();
-    __u32 *depth = bpf_task_storage_get(&inner_open, task, 0, 0);
-
-    return depth && *depth;
 }
 
 SEC("fexit/security_file_open")
@@ -184,6 +193,8 @@ int BPF_PROG(file_open_exit, struct file *file)
     struct file_event_t *e;
     struct open_key key = {};
     struct task_struct *task, *leader;
+    struct inode *inode;
+    bool layer;
     u32 zero = 0, pid, tid, uid, mode, flags;
     u16 access = 0;
     u8 seen = 1;
@@ -192,12 +203,13 @@ int BPF_PROG(file_open_exit, struct file *file)
 
     if (bpf_get_func_ret(ctx, &ret) || (int)ret)
         return 0;
-    if ((BPF_CORE_READ(file, f_inode, i_mode) & S_IFMT) != S_IFREG)
+    if ((BPF_CORE_READ(file, f_path.dentry, d_inode, i_mode) & S_IFMT) != S_IFREG)
         return 0;
     task = (struct task_struct *)bpf_get_current_task();
     if (BPF_CORE_READ(task, flags) & PF_KTHREAD)
         return 0;
-    if (is_inner_open())
+    layer = internal_mount(BPF_CORE_READ(file, f_path.mnt));
+    if (layer_open_to_skip(file, layer))
         return 0;
     uid = bpf_get_current_uid_gid();
     ns_pid_tid(pidns_ino, &pid, &tid);
@@ -225,7 +237,11 @@ int BPF_PROG(file_open_exit, struct file *file)
     key.tgid = bpf_get_current_pid_tgid() >> 32;
     key.mnt = (u64)BPF_CORE_READ(file, f_path.mnt);
     key.dentry = (u64)BPF_CORE_READ(file, f_path.dentry);
-    key.ino = BPF_CORE_READ(file, f_inode, i_ino);
+    /* The inode the path names, not f_inode: before 6.8, overlayfs's open
+     * of the file beneath carries the overlay path with the layer's inode,
+     * and must read as the open already reported. */
+    inode = BPF_CORE_READ(file, f_path.dentry, d_inode);
+    key.ino = BPF_CORE_READ(inode, i_ino);
     key.access = access;
     /* NOEXIST makes the check and the insert one step, as for listensnoop's
      * peers: of two threads opening the same new file at once, exactly one
@@ -238,13 +254,14 @@ int BPF_PROG(file_open_exit, struct file *file)
         goto lost;
     e->timestamp_ns = bpf_ktime_get_ns();
     e->ino = key.ino;
-    e->dev = BPF_CORE_READ(file, f_inode, i_sb, s_dev);
+    e->dev = BPF_CORE_READ(inode, i_sb, s_dev);
     e->pid = pid;
     e->tid = tid;
     e->host_pid = key.tgid;
     e->uid = uid;
     e->flags = flags;
     e->access = access;
+    e->layer = layer;
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
     len = bpf_d_path(&file->f_path, e->path, sizeof(e->path));
     if (len < 1 || len > FILE_PATH_LEN) {

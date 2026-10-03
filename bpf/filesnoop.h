@@ -20,7 +20,8 @@ struct file_event_t {
     __u32 host_pid; /* in the initial PID namespace */
     __u32 uid;
     __u32 flags;    /* open(2) flags as the caller passed them */
-    __u16 access;   /* FILE_ACCESS_* */
+    __u8 access;    /* FILE_ACCESS_* */
+    __u8 layer;     /* 1: opened on an overlay layer's internal mount */
     __s16 path_err; /* bpf_d_path's error, 0 if path holds the path */
     char comm[FILE_COMM_LEN];
     /* Only the used part, NUL included, is sent: the event's size says

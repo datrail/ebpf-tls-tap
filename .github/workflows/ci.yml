@@ -118,7 +118,9 @@ jobs:
       # a child's reads, writes, read-writes and exec, repeated and from
       # eight threads at once; the opens that must stay silent; a non-UTF-8
       # name; -p; a stalled reader whose gap must surface as "lost". The
-      # runner can mount overlayfs, so the overlay case is required here:
-      # without the inner-open skip, a container's every file reads twice.
+      # runner can mount overlayfs, so the overlay cases are required here:
+      # a runtime-mounted overlay must give no layer events (a container's
+      # every file would read twice), and one mounted in a user namespace
+      # must report the layer file (else it hides what is read).
       - name: filesnoop reports each file open once per access
         run: sudo REQUIRE_OVERLAY=1 python3 tests/filesnoop_test.py bpf/filesnoop

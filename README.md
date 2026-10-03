@@ -175,18 +175,27 @@ sudo ./bpf/filesnoop              # or -p <pid> / -u <uid> / -n
   not UTF-8 prints each invalid byte as U+FFFD and adds `path_hex`, the exact
   bytes. If the kernel can't produce the path, `path` is empty and
   `path_error` holds the error.
-- overlayfs, every container's root, opens the layer file beneath on the
-  opener's behalf. That inner open is skipped (`backing_file_open`, or
-  `open_with_fake_path` before 6.6): it is the same open, under a path the
-  process never named.
+- overlayfs opens files in its layers on the opener's behalf: the file
+  beneath the one the process asked for, and the lower file when a write
+  copies it up. Those opens happen on a private mount of the layer. For an
+  overlay mounted from the initial user namespace, which is how a container
+  runtime mounts a container's root, they are skipped while the process's
+  own open is in progress: they are that open, under a path the process never
+  named. Any other open on such a mount is reported with `"layer":true`.
+  There, `path` is relative to the layer, and `dev` and `ino` are the file
+  actually read or written. That is how an unprivileged process that mounts
+  its own overlay, in a user namespace, over a directory it can read still
+  shows which file it read. Rootless container runtimes mount that way too,
+  so their containers' first opens come with layer events.
 - `-p`, `-u`, `-n`, `-H`, the `start`/`alive` records and `lost` work as for
   listensnoop. filesnoop's own opens are left out.
 - Not covered:
   - files already open when it starts, and reads or writes through a
     descriptor opened before then or passed in from another process;
   - directories, devices, FIFOs and sockets;
-  - `O_PATH` opens (they can't read or write), and metadata-only calls
-    (`stat`, `rename`, `unlink`, `chmod`);
+  - `O_PATH` opens (they can't read or write), and calls that act on a
+    path without opening it: `truncate(2)` (which can empty a file),
+    `stat`, `rename`, `unlink`, `chmod`;
   - `mmap` of a file already open.
 
 Opens are frequent: unfiltered on a busy host it prints thousands of lines a
@@ -198,8 +207,9 @@ Events are variable-length, in a 4 MiB ring buffer of its own.
 `tests/filesnoop_test.py` runs in CI and checks the exact event set: each
 access once however often or concurrently repeated, the open flags, exec and
 its interpreter, the silent cases (a directory, a device, `O_PATH`, a failed
-open), a non-UTF-8 name, a file on an overlay mount, `-p`, and a stalled
-reader whose gap must be counted.
+open), a non-UTF-8 name, an overlay a runtime mounted (no layer events, a
+copy-up included), an overlay mounted in a user namespace (the layer file
+reported), `-p`, and a stalled reader whose gap must be counted.
 
 ## Architecture
 
@@ -241,7 +251,7 @@ through GitHub Security Advisories.
 git submodule update --init --recursive
 make build-bpf
 sudo python3 tests/listensnoop_test.py   # listensnoop end to end (needs cc, python3)
-sudo python3 tests/filesnoop_test.py     # filesnoop end to end (needs python3)
+sudo python3 tests/filesnoop_test.py     # filesnoop end to end (needs python3, mount, unshare)
 ```
 
 The build and probe checks require the Linux C/eBPF toolchain; see

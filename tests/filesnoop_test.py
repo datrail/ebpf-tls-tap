@@ -14,8 +14,12 @@ path and flags it used, and nothing for the opens that must stay silent:
 - O_CREAT, O_TRUNC and O_APPEND are reported as asked;
 - a directory, a device, an O_PATH open and a failed open are not reported;
 - a name that isn't UTF-8 keeps its exact bytes in "path_hex";
-- a file on overlayfs, as in every container, is reported once, by the path
-  the process used: not again for the layer file overlayfs opens beneath it;
+- a file on an overlay a runtime mounted, as for every container's root, is
+  reported once, by the path the process used: never again for a layer file
+  overlayfs opens beneath it or copies up from;
+- an overlay an unprivileged process mounts in its own user namespace can't
+  hide what it reads: the layer file is reported too, marked "layer", with
+  the real file's device and inode;
 - -p leaves out a decoy process;
 - when the reader stalls and the buffer overflows, the gap shows up on
   stdout as "lost", and every open is either reported or counted there;
@@ -193,7 +197,9 @@ def test_exact_events(tmp):
             subprocess.run(["umount", os.path.dirname(merged)])
 
     opens = [e for e in events if e.get("kind") == "open"]
-    check(not [e for e in events if e.get("kind") == "lost"], "events were lost")
+    # "lost" counts skipped calls host-wide, whatever -p says, so a busy
+    # host can print one here; it only matters if events are missing.
+    lost = sum(e["count"] for e in events if e.get("kind") == "lost")
     check(all(e["pid"] == child.pid for e in opens),
           f"-p let in another process: {[e for e in opens if e['pid'] != child.pid]}")
     roots = (work, merged) if merged else (work,)
@@ -203,21 +209,78 @@ def test_exact_events(tmp):
     got = sorted(key(e) for e in mine)
     want = sorted((x["path"],) + tuple(x[k] for k in ("read", "write", "exec", "creat", "trunc", "append"))
                   for x in expected)
-    check(got == want, "events for the child's files differ:\n  got  %s\n  want %s" % (got, want))
+    check(got == want, "events for the child's files differ (%d lost):\n  got  %s\n  want %s"
+          % (lost, got, want))
     for e in mine:
         check(e["comm"] == "python3" or e["comm"].startswith("python"),
               f"unexpected comm {e['comm']}")
         check(isinstance(e["ino"], int) and ":" in e["dev"], f"no dev/ino in {e}")
     check(not [e for e in opens if e["path"] in ("/dev/null", work)],
           "a device or directory open was reported")
-    if merged:
-        check(not [e for e in opens if "/upper/" in e["path"] or "/lower/" in e["path"]],
-              "overlayfs's own open of the layer file was reported")
+    # A layer open's path is relative to the layer, so it can't be told by
+    # path; the flag says it. The child's root is a runtime overlay in a
+    # container, and its test files one when overlay could be mounted.
+    check(not [e for e in opens if e.get("layer")],
+          f"overlayfs's own layer opens were reported: {[e for e in opens if e.get('layer')]}")
     # The kernel opens a dynamic binary's ELF interpreter for exec too.
     execs = [e["path"] for e in opens if e["exec"]]
     check(execs[:1] == [prog] and all("/ld-" in p for p in execs[1:]),
           f"expected an exec event for {prog}, then at most its loader: {execs}")
     print(f"exact events: {len(mine)} file events, {len(execs)} exec")
+
+
+# Run as root inside a new user namespace, so the overlay it mounts is not
+# the initial namespace's, as for an unprivileged process: mounts an overlay
+# over argv[1] at argv[2] and reads the secret through it.
+USERNS_READER = r"""
+import os, subprocess, sys
+secret_dir, merged = sys.argv[1], sys.argv[2]
+subprocess.run(["mount", "-t", "overlay", "overlay", "-o",
+                "lowerdir=%s:%s" % (secret_dir, sys.argv[3]), merged], check=True)
+sys.stdin.readline()  # wait until filesnoop is attached
+os.close(os.open(os.path.join(merged, "id_rsa"), os.O_RDONLY))
+"""
+
+
+def test_userns_overlay(tmp):
+    base = os.path.join(tmp, "userns")
+    for sub in ("secret", "empty", "merged"):
+        os.makedirs(os.path.join(base, sub))
+    secret = os.path.join(base, "secret", "id_rsa")
+    with open(secret, "w") as f:
+        f.write("not really a key\n")
+    st = os.stat(secret)
+    try:
+        reader = subprocess.Popen(
+            ["unshare", "-Urm", sys.executable, "-c", USERNS_READER,
+             os.path.join(base, "secret"), os.path.join(base, "merged"),
+             os.path.join(base, "empty")],
+            stdin=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError:
+        sys.exit("unshare not found")
+    time.sleep(1)
+    if reader.poll() is not None:
+        msg = f"user-namespace overlay unavailable: {reader.stderr.read().strip()}"
+        if os.environ.get("REQUIRE_OVERLAY"):
+            sys.exit(msg)
+        print("note:", msg)
+        return
+    snoop = start(["-p", str(reader.pid)])
+    reader.stdin.write("go\n"); reader.stdin.flush()
+    check(reader.wait(timeout=30) == 0, f"reader failed: {reader.stderr.read()}")
+    time.sleep(0.5)
+    opens = [e for e in stop(snoop) if e.get("kind") == "open"]
+    layer = [e for e in opens if e.get("layer")]
+    want_dev = "%d:%d" % (os.major(st.st_dev), os.minor(st.st_dev))
+    # Where tmp is itself on an overlay (a container), the layer beneath that
+    # is opened and reported too.
+    check((st.st_ino, want_dev) in [(e["ino"], e["dev"]) for e in layer]
+          and all(e["read"] and not e["write"] for e in layer),
+          f"the secret read through a user-namespace overlay was not reported as "
+          f"{want_dev}/{st.st_ino}: {layer}")
+    check([e for e in opens if not e.get("layer") and e["path"].endswith("/merged/id_rsa")],
+          "the read through the overlay path itself was not reported")
+    print(f"user-namespace overlay: {len(layer)} layer event(s)")
 
 
 def test_lost_and_self(tmp):
@@ -251,6 +314,7 @@ def main():
         sys.exit("needs root")
     with tempfile.TemporaryDirectory(prefix="filesnoop-test-") as tmp:
         test_exact_events(tmp)
+        test_userns_overlay(tmp)
         test_lost_and_self(tmp)
     if failures:
         print(f"{len(failures)} failure(s)")

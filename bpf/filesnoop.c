@@ -52,7 +52,8 @@ const char argp_program_doc[] =
 	"process opens a file for a given access: \"read\", \"write\" and\n"
 	"\"exec\" say which. Opening it again the same way prints nothing; opening\n"
 	"it another way prints again. \"path\" is the path as the process sees\n"
-	"it. A \"kind\":\"lost\" line means events were dropped. Files already\n"
+	"it; with \"layer\":true, overlayfs opened it in a layer beneath, and the\n"
+	"path is the layer's. A \"kind\":\"lost\" line means events were dropped. Files already\n"
 	"open when it starts are not reported.\n"
 	"PIDs, and -p, are as filesnoop's own PID namespace sees them; a process\n"
 	"it cannot see has pid 0 and only its host_pid, or is left out with -n.\n"
@@ -241,6 +242,10 @@ static int handle_event(void *ctx, void *data, size_t data_size)
 	}
 	if (e->path_err)
 		printf(",\"path_error\":%d", e->path_err);
+	/* Opened on a layer's internal mount: path is relative to the layer,
+	 * dev and ino are the file actually read or written. */
+	if (e->layer)
+		printf(",\"layer\":true");
 	/* creat/trunc/append are what the caller asked for: O_CREAT on a file
 	 * that already exists opens it without creating anything. */
 	printf(",\"read\":%s,\"write\":%s,\"exec\":%s,"
@@ -295,18 +300,14 @@ int main(int argc, char **argv)
 	obj->rodata->own_ns_only = env.own_namespace;
 	obj->rodata->self_pid = getpid();
 
-	/* overlayfs's inner open is backing_file_open from 6.6 and
-	 * open_with_fake_path before; attach whichever this kernel has. With
-	 * neither (no overlayfs), there is no inner open to skip. */
+	/* do_dentry_open is static, so a kernel may have inlined it. Without
+	 * its exit, the overlay open in progress is only replaced by the
+	 * task's next open, which skips at most the layer opens in between. */
 	struct btf *vmlinux = btf__load_vmlinux_btf();
-	bool backing = kernel_has_func(vmlinux, "backing_file_open");
-	bool fake = !backing && kernel_has_func(vmlinux, "open_with_fake_path");
 
+	bpf_program__set_autoload(obj->progs.dentry_open_exit,
+				  kernel_has_func(vmlinux, "do_dentry_open"));
 	btf__free(vmlinux);
-	bpf_program__set_autoload(obj->progs.backing_open_enter, backing);
-	bpf_program__set_autoload(obj->progs.backing_open_exit, backing);
-	bpf_program__set_autoload(obj->progs.fake_path_open_enter, fake);
-	bpf_program__set_autoload(obj->progs.fake_path_open_exit, fake);
 
 	err = filesnoop_bpf__load(obj);
 	if (err) {
