@@ -16,7 +16,8 @@ path and flags it used, and nothing for the opens that must stay silent:
 - a name that isn't UTF-8 keeps its exact bytes in "path_hex";
 - a file on an overlay a runtime mounted, as for every container's root, is
   reported once, by the path the process used: never again for a layer file
-  overlayfs opens beneath it or copies up from;
+  overlayfs opens beneath it or copies up from, on open or on chmod;
+- a memfd reopened through /proc is reported, not taken for a layer;
 - an overlay an unprivileged process mounts in its own user namespace can't
   hide what it reads: the layer file is reported too, marked "layer", with
   the real file's device and inode;
@@ -108,6 +109,16 @@ if overlay != "-":
     exp(o, read=True)
     os.close(os.open(o, os.O_WRONLY | os.O_APPEND))
     exp(o, write=True, append=True)
+    # chmod copies a lower file up without opening it: overlayfs reads the
+    # lower file and writes the upper one, and the process opened neither.
+    os.chmod(os.path.join(overlay, "chmod.txt"), 0o600)
+
+# A memfd reopened through /proc is on shmem's internal mount, but the
+# process opened it itself: reported, not as a layer.
+m = os.memfd_create("filesnoop-test")
+os.write(m, b"x")
+os.close(os.open("/proc/self/fd/%d" % m, os.O_RDONLY))
+exp("/memfd:filesnoop-test (deleted)", read=True)
 
 print(json.dumps(expected), flush=True)
 sys.stdin.readline()  # wait until the parent has read the list
@@ -151,8 +162,9 @@ def mount_overlay(base):
         return None
     for sub in ("lower", "upper", "work", "merged"):
         os.mkdir(os.path.join(layers, sub))
-    with open(os.path.join(layers, "lower", "lower.txt"), "w") as f:
-        f.write("from the lower layer\n")
+    for name in ("lower.txt", "chmod.txt"):
+        with open(os.path.join(layers, "lower", name), "w") as f:
+            f.write("from the lower layer\n")
     merged = os.path.join(layers, "merged")
     opts = "lowerdir={0}/lower,upperdir={0}/upper,workdir={0}/work".format(layers)
     if subprocess.run(["mount", "-t", "overlay", "overlay", "-o", opts, merged]).returncode:
@@ -205,7 +217,7 @@ def test_exact_events(tmp):
     roots = (work, merged) if merged else (work,)
     mine = [e for e in opens
             if (bytes.fromhex(e["path_hex"]).decode("utf-8", "surrogateescape")
-                if "path_hex" in e else e["path"]).startswith(roots)]
+                if "path_hex" in e else e["path"]).startswith(roots + ("/memfd:",))]
     got = sorted(key(e) for e in mine)
     want = sorted((x["path"],) + tuple(x[k] for k in ("read", "write", "exec", "creat", "trunc", "append"))
                   for x in expected)

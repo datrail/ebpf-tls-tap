@@ -176,23 +176,26 @@ sudo ./bpf/filesnoop              # or -p <pid> / -u <uid> / -n
   bytes. If the kernel can't produce the path, `path` is empty and
   `path_error` holds the error.
 - overlayfs opens files in its layers on the opener's behalf: the file
-  beneath the one the process asked for, and the lower file when a write
-  copies it up. Those opens happen on a private mount of the layer. For an
-  overlay mounted from the initial user namespace, which is how a container
-  runtime mounts a container's root, they are skipped while the process's
-  own open is in progress: they are that open, under a path the process never
-  named. Any other open on such a mount is reported with `"layer":true`.
-  There, `path` is relative to the layer, and `dev` and `ino` are the file
-  actually read or written. That is how an unprivileged process that mounts
-  its own overlay, in a user namespace, over a directory it can read still
-  shows which file it read. Rootless container runtimes mount that way too,
-  so their containers' first opens come with layer events.
+  beneath the one the process asked for, the lower file when a write,
+  `chmod`, `truncate` or the like copies it up, and the upper file again
+  when a read follows a copy-up. Those opens run with the credentials of
+  whoever mounted the overlay. When that is the initial user namespace,
+  which is how a container runtime mounts a container's root, they are
+  skipped: they only repeat the process's own open under a path it never
+  named, or, for a `chmod`, invent one. Any other layer open is reported
+  with `"layer":true`, and `dev` and `ino` are the file actually read or
+  written. That is how an unprivileged process that mounts its own overlay
+  in a user namespace, over a directory it can read, still shows which file
+  it read. `path` is then relative to the layer (6.8 and later) or the
+  overlay's path (before). Rootless container runtimes mount from a user
+  namespace too, so their containers' first opens come with layer events.
 - `-p`, `-u`, `-n`, `-H`, the `start`/`alive` records and `lost` work as for
   listensnoop. filesnoop's own opens are left out.
 - Not covered:
   - files already open when it starts, and reads or writes through a
     descriptor opened before then or passed in from another process;
-  - directories, devices, FIFOs and sockets;
+  - directories, devices, FIFOs and sockets, and pidfds and namespace files
+    (`/proc/<pid>/ns/*`), which carry no file content;
   - `O_PATH` opens (they can't read or write), and calls that act on a
     path without opening it: `truncate(2)` (which can empty a file),
     `stat`, `rename`, `unlink`, `chmod`;

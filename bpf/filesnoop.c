@@ -6,7 +6,6 @@
 // event dropped.
 #include <argp.h>
 #include <bpf/bpf.h>
-#include <bpf/btf.h>
 #include <bpf/libbpf.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -242,8 +241,9 @@ static int handle_event(void *ctx, void *data, size_t data_size)
 	}
 	if (e->path_err)
 		printf(",\"path_error\":%d", e->path_err);
-	/* Opened on a layer's internal mount: path is relative to the layer,
-	 * dev and ino are the file actually read or written. */
+	/* Opened by overlayfs in a layer: dev and ino are the file actually
+	 * read or written; path is relative to the layer (from 6.8) or the
+	 * overlay path (before). */
 	if (e->layer)
 		printf(",\"layer\":true");
 	/* creat/trunc/append are what the caller asked for: O_CREAT on a file
@@ -261,11 +261,6 @@ static int handle_event(void *ctx, void *data, size_t data_size)
 	       (unsigned long long)e->ino);
 	fflush(stdout);
 	return 0;
-}
-
-static bool kernel_has_func(const struct btf *vmlinux, const char *name)
-{
-	return vmlinux && btf__find_by_name_kind(vmlinux, name, BTF_KIND_FUNC) >= 0;
 }
 
 int main(int argc, char **argv)
@@ -299,15 +294,6 @@ int main(int argc, char **argv)
 	obj->rodata->pidns_ino = ns.st_ino;
 	obj->rodata->own_ns_only = env.own_namespace;
 	obj->rodata->self_pid = getpid();
-
-	/* do_dentry_open is static, so a kernel may have inlined it. Without
-	 * its exit, the overlay open in progress is only replaced by the
-	 * task's next open, which skips at most the layer opens in between. */
-	struct btf *vmlinux = btf__load_vmlinux_btf();
-
-	bpf_program__set_autoload(obj->progs.dentry_open_exit,
-				  kernel_has_func(vmlinux, "do_dentry_open"));
-	btf__free(vmlinux);
 
 	err = filesnoop_bpf__load(obj);
 	if (err) {
