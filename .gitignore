@@ -3,3 +3,4 @@ bpf/sslsniff
 bpf/listensnoop
 *.o
 *.skel.h
+bpf/filesnoop

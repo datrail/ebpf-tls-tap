@@ -23,6 +23,7 @@
 
 #include "listensnoop.h"
 #include "listensnoop.skel.h"
+#include "snoop_util.h"
 
 #define POLL_TIMEOUT_MS 100
 #define INVALID_UID -1
@@ -141,23 +142,6 @@ static void sig_int(int signo)
 	exiting = 1;
 }
 
-/* comm is attacker-chosen (prctl PR_SET_NAME), so escape it fully. */
-static void print_json_string(const char *s, size_t max)
-{
-	putchar('"');
-	for (size_t i = 0; i < max && s[i]; i++) {
-		unsigned char c = s[i];
-
-		if (c == '"' || c == '\\')
-			printf("\\%c", c);
-		else if (c < 0x20 || c >= 0x7f)
-			printf("\\u%04x", c);
-		else
-			putchar(c);
-	}
-	putchar('"');
-}
-
 static const char *protocol_name(__u16 protocol)
 {
 	switch (protocol) {
@@ -255,48 +239,6 @@ static int handle_event(void *ctx, void *data, size_t data_size)
 	}
 	printf("}\n");
 	fflush(stdout);
-	return 0;
-}
-
-/* Report events missed since the last check: those the ring buffer had no
- * room for, and calls a program skipped because it was already running on
- * that CPU (the kernel's recursion_misses; a preempted program blocks its
- * own next run there, and an unprivileged process can arrange that). On
- * stdout, not just stderr: a consumer must know it has a gap, or an agent
- * could hide the one listen() that matters. */
-static int report_drops(struct listensnoop_bpf *obj, __u64 *reported)
-{
-	int ncpus = libbpf_num_possible_cpus();
-	struct bpf_program *prog;
-	__u32 zero = 0;
-	__u64 total = 0;
-
-	if (ncpus <= 0)
-		return ncpus;
-	__u64 counts[ncpus];
-	if (bpf_map_lookup_elem(bpf_map__fd(obj->maps.dropped), &zero, counts))
-		return -errno;
-	for (int i = 0; i < ncpus; i++)
-		total += counts[i];
-	bpf_object__for_each_program(prog, obj->obj) {
-		struct bpf_prog_info info = {};
-		__u32 len = sizeof(info);
-		int fd = bpf_program__fd(prog);
-
-		if (fd < 0)
-			continue; /* not loaded, e.g. inet6_bind without IPv6 */
-		if (bpf_prog_get_info_by_fd(fd, &info, &len))
-			return -errno;
-		total += info.recursion_misses;
-	}
-	if (total > *reported) {
-		printf("{\"kind\":\"lost\",\"count\":%llu}\n",
-		       (unsigned long long)(total - *reported));
-		fflush(stdout);
-		fprintf(stderr, "lost %llu events\n",
-			(unsigned long long)(total - *reported));
-		*reported = total;
-	}
 	return 0;
 }
 
@@ -429,7 +371,7 @@ int main(int argc, char **argv)
 		    (now.tv_nsec - last_report.tv_nsec) / 1000000 < POLL_TIMEOUT_MS)
 			continue;
 		last_report = now;
-		err = report_drops(obj, &drops_reported);
+		err = report_drops(obj->obj, bpf_map__fd(obj->maps.dropped), &drops_reported);
 		if (err) {
 			fprintf(stderr, "can't read drop counters: %s\n",
 				strerror(-err));
@@ -438,7 +380,7 @@ int main(int argc, char **argv)
 	}
 	/* Print what was queued before the signal, and any last gap. */
 	ring_buffer__consume(rb);
-	err = report_drops(obj, &drops_reported);
+	err = report_drops(obj->obj, bpf_map__fd(obj->maps.dropped), &drops_reported);
 
 cleanup:
 	ring_buffer__free(rb);

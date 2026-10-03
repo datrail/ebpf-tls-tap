@@ -4,7 +4,9 @@ eBPF TLS Tap is DatRail's low-level Linux TLS observation component. It builds
 `bpf/sslsniff`, which attaches uprobes to OpenSSL, GnuTLS, and NSS and prints
 decrypted TLS traffic for inspection and downstream parsing, and
 `bpf/listensnoop`, which reports every TCP, UDP or ICMP-echo socket that
-starts accepting inbound traffic, and who connects to it.
+starts accepting inbound traffic, and who connects to it, and
+`bpf/filesnoop`, which reports the files a process opens to read, write or
+run.
 
 ## Quick start
 
@@ -138,6 +140,67 @@ native-thread contention, CPU oversubscription and a stalled reader, plus
 accepted peers (repeats, eight threads accepting one peer at once, a
 dual-stack listener, an unaccepted connection).
 
+## File opens
+
+An agent's tool calls say which files it *asked* to read or write; what it
+actually opened is the kernel's to say. An agent that reads `~/.ssh/id_rsa`
+through a shell command, or rewrites a file outside its workspace, does it with
+`open()`. `filesnoop` reports the first time each process opens each regular
+file for each kind of access:
+
+```bash
+sudo ./bpf/filesnoop              # or -p <pid> / -u <uid> / -n
+```
+
+```json
+{"timestamp_ns":184342893154352,"kind":"open","pid":8468,"tid":8468,"host_pid":2831976,"uid":0,"comm":"bash","path":"/tmp/fs/d/w.txt","read":false,"write":true,"exec":false,"creat":true,"trunc":true,"append":false,"dev":"0:925","ino":82066872}
+```
+
+- One line per (process, file, access). `read`, `write` and `exec` say how it
+  was opened; `O_RDWR` is one line with both. Opening the file the same way
+  again prints nothing; opening it another way prints again. A process is its
+  host PID, start time and exec count, as for listensnoop's peers. The file
+  is the path it was opened by plus its inode, so a hard link or bind mount
+  reads as its own path. That memory is a 65,536-entry LRU: past that, an
+  old file can be reported again.
+- The hook is `security_file_open`, on return, so only opens the LSMs allowed
+  are reported, from `open()`, `openat()`, `openat2()`, io_uring and
+  `execve()` alike. `exec` marks the program `execve()` runs, and then the
+  ELF interpreter the kernel opens for it.
+- `creat`, `trunc` and `append` are the flags the caller passed. `O_CREAT` on
+  a file that already exists creates nothing.
+- `path` is what the process would see: it is resolved against the opener's
+  root, so a container's `/etc/passwd` reads as `/etc/passwd`. An unlinked
+  file's path ends in ` (deleted)`, as in `/proc/<pid>/fd`. A path that is
+  not UTF-8 prints each invalid byte as U+FFFD and adds `path_hex`, the exact
+  bytes. If the kernel can't produce the path, `path` is empty and
+  `path_error` holds the error.
+- overlayfs, every container's root, opens the layer file beneath on the
+  opener's behalf. That inner open is skipped (`backing_file_open`, or
+  `open_with_fake_path` before 6.6): it is the same open, under a path the
+  process never named.
+- `-p`, `-u`, `-n`, `-H`, the `start`/`alive` records and `lost` work as for
+  listensnoop. filesnoop's own opens are left out.
+- Not covered:
+  - files already open when it starts, and reads or writes through a
+    descriptor opened before then or passed in from another process;
+  - directories, devices, FIFOs and sockets;
+  - `O_PATH` opens (they can't read or write), and metadata-only calls
+    (`stat`, `rename`, `unlink`, `chmod`);
+  - `mmap` of a file already open.
+
+Opens are frequent: unfiltered on a busy host it prints thousands of lines a
+second (every process loading its libraries counts), so give it `-p`, `-u`
+or `-n` where you can. Measured on a 7.3 kernel, a repeated `open()`/`close()`
+of one file costs about 0.2 µs more with it attached (0.81 µs against 0.60).
+Events are variable-length, in a 4 MiB ring buffer of its own.
+
+`tests/filesnoop_test.py` runs in CI and checks the exact event set: each
+access once however often or concurrently repeated, the open flags, exec and
+its interpreter, the silent cases (a directory, a device, `O_PATH`, a failed
+open), a non-UTF-8 name, a file on an overlay mount, `-p`, and a stalled
+reader whose gap must be counted.
+
 ## Architecture
 
 ```mermaid
@@ -150,6 +213,10 @@ flowchart LR
   kfn --> ring[Ring buffer + drop counter]
   ring --> listensnoop[Userspace listensnoop]
   listensnoop -->|JSON lines| output
+  process -->|open / openat / execve| ffn[eBPF fexit on security_file_open]
+  ffn --> fring[Ring buffer + drop counter]
+  fring --> filesnoop[Userspace filesnoop]
+  filesnoop -->|JSON lines| output
 ```
 
 sslsniff's kernel program observes TLS-library entry and return points; its
@@ -162,7 +229,8 @@ kernel type-header sources needed for reproducible builds.
 These programs require elevated BPF privileges. sslsniff exposes plaintext
 that TLS normally protects; listensnoop reads no payload, only socket
 addresses (including the addresses of clients that connect), process names
-and IDs. Restrict capture to the intended process,
+and IDs; filesnoop reads no file content, but file paths can themselves be
+sensitive (a user's home directory, a project's name). Restrict capture to the intended process,
 protect stdout and downstream logs, and never run either on a host or workload
 you are not authorized to observe. Read [SECURITY.md](SECURITY.md) and report vulnerabilities privately
 through GitHub Security Advisories.
@@ -173,6 +241,7 @@ through GitHub Security Advisories.
 git submodule update --init --recursive
 make build-bpf
 sudo python3 tests/listensnoop_test.py   # listensnoop end to end (needs cc, python3)
+sudo python3 tests/filesnoop_test.py     # filesnoop end to end (needs python3)
 ```
 
 The build and probe checks require the Linux C/eBPF toolchain; see
