@@ -244,7 +244,7 @@ that TLS normally protects; listensnoop reads no payload, only socket
 addresses (including the addresses of clients that connect), process names
 and IDs; filesnoop reads no file content, but file paths can themselves be
 sensitive (a user's home directory, a project's name). Restrict capture to the intended process,
-protect stdout and downstream logs, and never run either on a host or workload
+protect stdout and downstream logs, and never run any of them on a host or workload
 you are not authorized to observe. Read [SECURITY.md](SECURITY.md) and report vulnerabilities privately
 through GitHub Security Advisories.
 
@@ -263,9 +263,19 @@ dependencies.
 
 ## Related projects
 
+eBPF TLS Tap is one component of DatRail. To run the whole stack, start at
+[datrail-project](https://github.com/datrail/datrail-project#readme); its
+[glossary](https://github.com/datrail/datrail-project/blob/master/docs/glossary.md)
+explains DatRail's terms.
+
 - [RailMon](https://github.com/datrail/railmon) provides DatRail's supported
-  structured capture and export path through AgentSight.
-- [RailDash](https://github.com/datrail/raildash) presents structured captures.
+  structured capture and export path through AgentSight, and runs
+  `listensnoop` as `railmon listen`.
+- [RailDash](https://github.com/datrail/raildash) presents structured captures
+  and Agent Security Profiles (ASPs).
+- [DatRail Proxy](https://github.com/datrail/proxy) and
+  [DatRail Gateway](https://github.com/datrail/gateway) attach and check
+  agent identity tickets on MCP calls.
 
 ## License
 
