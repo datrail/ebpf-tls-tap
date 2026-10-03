@@ -224,8 +224,10 @@ def test_exact_events(tmp):
     check(got == want, "events for the child's files differ (%d lost):\n  got  %s\n  want %s"
           % (lost, got, want))
     for e in mine:
-        check(e["comm"] == "python3" or e["comm"].startswith("python"),
-              f"unexpected comm {e['comm']}")
+        # comm is the thread's: Python 3.14 names its threads, so only the
+        # main thread's opens say "python".
+        if e["tid"] == e["pid"]:
+            check(e["comm"].startswith("python"), f"unexpected comm {e['comm']}")
         check(isinstance(e["ino"], int) and ":" in e["dev"], f"no dev/ino in {e}")
     check(not [e for e in opens if e["path"] in ("/dev/null", work)],
           "a device or directory open was reported")
