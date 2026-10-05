@@ -43,7 +43,7 @@ jobs:
       # carries its own nested libbpf; a one-level fetch builds libbpf and then
       # fails on bpftool with "No rule to make target bpftool/libbpf/src/hashmap.h".
       # Both upstreams are public, so the default token is enough.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
           submodules: recursive
