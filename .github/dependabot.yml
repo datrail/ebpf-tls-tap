@@ -1,0 +1,14 @@
+# Weekly dependency updates (DR-298). Minor and patch bumps are grouped, so
+# the repo gets at most one PR a week from them; majors and security updates
+# come as their own PRs. The bpftool/libbpf submodules are pinned by hand and
+# left out on purpose.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        update-types: ["minor", "patch"]
