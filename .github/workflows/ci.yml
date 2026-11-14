@@ -13,6 +13,10 @@ on:
   pull_request:
   push:
     branches: [master]
+  # Weekly, so a break from a moved runner image, toolchain or apt package
+  # shows up even in a week with no commits (DR-298).
+  schedule:
+    - cron: "23 6 * * 1"
   workflow_call:
     inputs:
       ref:
